@@ -1,0 +1,41 @@
+{
+    "deviceID": "SIM-LEPU-05:16",
+    "epochTime": 1755147524,
+    "seqNum": 1,
+    "seqPart": 1,
+    "device": {
+        "deviceType": "LEPU",
+        "macAddress": "e2:93:d5:39:f7:5b",
+        "fwVersion": "RI0.0.3e",
+        "hwVersion": "1.4",
+        "batteryLevel": "2",
+        "alarms": []
+    },
+    "bp": {
+        "bpSystolic": 151,
+        "bpDiastolic": 82,
+        "map": 134,
+        "bpError": 1,
+        "bpErrorMsg": "Pressure cuff not tied well",
+        "cycleDuration": 60
+    },
+    "spo2": {
+        "spo2": 98,
+        "spo2Error": 0,
+        "sp2ErrorMsg": "",
+        "pulseRate": 70,
+        "prErrorMsg": "",
+        "pi": 0,
+        "cycleDuration": 0
+    },
+    "pleth": {
+        "plethWave": [
+            51,
+            48,
+            45,
+            41,
+            38,
+            36
+        ]
+    }
+}

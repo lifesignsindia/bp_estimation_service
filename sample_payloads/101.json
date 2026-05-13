@@ -1,0 +1,31 @@
+{ 
+    "deviceID": "WA98AD87", 
+    "epochTime": 1777961931, 
+    "seqNum": 2, 
+    "seqPart": 1, 
+    "device": { 
+        "deviceType": "NISO101", 
+        "macAddress": "00:A0:50:58:72:DB", 
+        "fwVersion": "1.0.0", 
+        "hwVersion": "V5.2", 
+        "batteryLevel": "46" 
+    },
+    "spo2": { 
+        "spo2": [99, 99, 98, 99],
+        "spo2Error": 0, 
+        "sp2ErrorMsg": "no error", 
+        "pulseRate": [77, 78, 79, 78],
+        "pi": [39, 39, 40, 40],
+        "cycleDuration": 30 
+    }, 
+    "pleth": { 
+        "plethWave": [
+            975533, 976179, 976685, 977206, 977736, 978228
+        ] 
+    }, 
+    "accelerometer" : { 
+        "x-axis" : [23, 32, 34, 40],
+        "y-axis" : [23, 32, 34, 40],
+        "z-axis" : [23, 32, 34, 40]
+    } 
+}

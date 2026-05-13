@@ -1,0 +1,32 @@
+{ 
+    "deviceID": "CHECKME_DEV_001", 
+    "epochTime": 1777961931, 
+    "seqNum": 2, 
+    "seqPart": 1, 
+    "device": { 
+        "deviceType": "NISO103", 
+        "macAddress": "AA:BB:CC:DD:EE:02", 
+        "fwVersion": "1.2.3", 
+        "hwVersion": "V5.2", 
+        "batteryLevel": "75" 
+    },
+    "spo2": { 
+        "spo2": [98, 98, 98, 98],
+        "spo2Error": 0, 
+        "sp2ErrorMsg": "no error", 
+        "pulseRate": [70, 71, 70, 72],
+        "pi": [40, 40, 40, 40],
+        "cycleDuration": 30 
+    }, 
+    "pleth": { 
+        "plethWave": [
+            131, 132, 133, 156, 156, 156, 134, 135
+        ] 
+    }, 
+    "motion-vector" : { 
+        "x-axis" : [20, 21, 22, 23],
+        "y-axis" : [30, 31, 32, 33],
+        "z-axis" : [40, 41, 42, 43],
+        "magnitude": [50, 51, 52, 53]
+    } 
+}

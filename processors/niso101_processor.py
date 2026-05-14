@@ -33,9 +33,16 @@ class PPGFilter:
             return []
 
         x = np.array(samples, dtype=float)
+
+        # Median pre-filter: removes single-sample spikes before they corrupt
+        # the IIR filter state (which is initialised from x[0])
+        from scipy.signal import medfilt as _medfilt
+        x = _medfilt(x, kernel_size=15)
+
         if self.zi is None:
-            # Steady-state continuous state vector initialized at x[0] level
-            self.zi = signal.sosfilt_zi(self.sos) * x[0]
+            # Use median of first 10 samples — robust against outlier first sample
+            init_val = float(np.median(x[:10])) if len(x) >= 10 else float(x[0])
+            self.zi = signal.sosfilt_zi(self.sos) * init_val
 
         y, self.zi = signal.sosfilt(self.sos, x, zi=self.zi)
         return y.tolist()

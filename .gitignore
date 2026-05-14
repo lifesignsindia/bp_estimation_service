@@ -9,3 +9,7 @@ ENV/
 .vscode/
 .idea/
 *.log
+*.png
+*.mp4
+test_app/
+*.pdf

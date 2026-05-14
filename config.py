@@ -19,6 +19,26 @@ class SETTINGS:
 # The Blood Pressure AI was trained on 120Hz data.
 # Do NOT change this. All incoming data will be resampled to this frequency.
 MODEL_SAMPLING_RATE_HZ = 120
+SAMPLING_RATE_HZ       = 120   # default source rate (pipeline always delivers 120 Hz)
+
+# Physiological clamps applied after base+delta regression
+BP_SBP_LIMITS = (60, 250)
+BP_DBP_LIMITS = (30, 150)
+
+# ─── BP Inference Tuning ─────────────────────────────────────────────────────
+# Max ±delta the regression model can shift from the category base (mmHg)
+BP_DELTA_CLIP = 15.0
+
+# Category base BPs — (SBP, DBP) centre for each classifier label
+BP_CATEGORY_BASES = {
+    "hypo":   (90.0,  60.0),
+    "normal": (118.0, 76.0),
+    "hyper":  (142.0, 90.0),
+}
+
+# If the classifier's top-category probability is below this, fall back to
+# "normal" base regardless of device type
+BP_CONFIDENCE_THRESHOLD = 0.50
 
 # ─── Hardware Sentinels (Invalid Values) ─────────────────────────────────────
 BERRY_SPO2_INVALID      = 127

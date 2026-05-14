@@ -10,8 +10,8 @@ def compute_sqi_204(raw, clean):
     raw_arr = np.array(raw, dtype=float)
     
     # 1. Saturation check on RAW (pre-normalization) values
-    # Railing check: if 99.5% of samples are at the very top of the observed range
-    if len(raw_arr) > 0 and np.percentile(raw_arr, 99.5) > 0.98 * np.max(raw_arr) and np.max(raw_arr) > 0:
+    # True digital clipping: >2% of samples stuck at the exact ADC maximum
+    if len(raw_arr) > 0 and np.max(raw_arr) > 0 and np.mean(raw_arr == np.max(raw_arr)) > 0.02:
         return 0.2, False, "SATURATED"
         
     # 2. Amplitude check on the despiked signal

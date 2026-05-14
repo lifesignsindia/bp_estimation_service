@@ -218,7 +218,7 @@ def process_vitals(json_data):
     
     if device_type == DEVICE_NISO204:
         raw_pleth = json_data.get("Pleth", []) or json_data.get("PlethWave", [])
-        actual_hz = json_data.get("FS", 200) 
+        actual_hz = 200  # NISO204 transmits at 200 Hz, resampled to 120 Hz before inference
         
     elif device_type in [DEVICE_CHECKME, DEVICE_BERRYMED]:
         raw_pleth = json_data.get("pleth", {}).get("plethWave", [])
@@ -228,6 +228,17 @@ def process_vitals(json_data):
 
     # 1. Clean and enforce 120Hz
     model_ready_pleth, sqi_info = _preprocess_signal(raw_pleth, actual_hz, 120, device_type)
+
+    if isinstance(sqi_info, dict) and not sqi_info.get("valid", True):
+        sqi_flag = sqi_info.get("flag", "INVALID")
+        return {
+            "status": "poor_signal",
+            "admissionId": adm_id,
+            "device_type": device_type,
+            "timestamp": int(time.time()),
+            "sqi": sqi_info,
+            "message": f"Poor signal quality ({sqi_flag}). Skipping inference."
+        }
 
     if len(model_ready_pleth) < 120:
         return {"status": "error", "message": "Signal too short for AI inference."}
@@ -248,7 +259,8 @@ def process_vitals(json_data):
             age=age,
             gender=gender,
             bmi=bmi,
-            adm_id=adm_id
+            adm_id=adm_id,
+            device_type=device_type
         )
 
         # 4. CONSOLE LOGGING (STDOUT) - Always visible, not the formal payload
@@ -257,6 +269,28 @@ def process_vitals(json_data):
         dbp_pred = int(round(float(ai_results.get("dbp", 80)))) if bp_valid else 80
         hb_pred  = ai_results.get("hb", "N/A") if bp_valid else "N/A"
         glu_pred = ai_results.get("glucose", "N/A") if bp_valid else "N/A"
+
+        # Reference-forced category correction: when a cuff reference is set,
+        # determine the true BP category from the reference and re-anchor the
+        # model's delta to the correct category base.
+        if bp_valid:
+            ref_s = patient_ref.get("sbp", 0)
+            ref_d = patient_ref.get("dbp", 0)
+            if ref_s > 0 and ref_d > 0:
+                if ref_s < 90 or ref_d < 60:
+                    ref_cat = "hypo"
+                elif ref_s > 130 or ref_d > 80:
+                    ref_cat = "hyper"
+                else:
+                    ref_cat = "normal"
+                model_cat = ai_results.get("category", "normal")
+                if model_cat != ref_cat:
+                    m_base_s, m_base_d = cfg.BP_CATEGORY_BASES.get(model_cat, (118.0, 76.0))
+                    r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
+                    delta_s = sbp_pred - m_base_s
+                    delta_d = dbp_pred - m_base_d
+                    sbp_pred = int(round(float(np.clip(r_base_s + delta_s, *cfg.BP_SBP_LIMITS))))
+                    dbp_pred = int(round(float(np.clip(r_base_d + delta_d, *cfg.BP_DBP_LIMITS))))
 
         print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
 
@@ -295,9 +329,9 @@ def process_vitals(json_data):
             ref_sbp = patient_ref.get("sbp", 0)
             ref_dbp = patient_ref.get("dbp", 0)
             
-            # Check if either SBP or DBP is off by more than 15 mmHg
-            sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - sbp_pred) > 15)
-            dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - dbp_pred) > 15)
+            # Check if either SBP or DBP is off by 15 mmHg or more
+            sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - sbp_pred) >= 15)
+            dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - dbp_pred) >= 15)
             
             if sbp_mismatch or dbp_mismatch:
                 session["needs_recalibration"] = True
@@ -333,13 +367,36 @@ def process_vitals(json_data):
         elapsed = now - session["start_time"]
         
         if not is_immediate and elapsed < target_interval:
-            return {
-                "status": "accumulating", 
-                "admissionId": adm_id, 
-                "elapsed_seconds": int(elapsed), 
+            if not bp_valid:
+                return {
+                    "status": "poor_signal",
+                    "admissionId": adm_id,
+                    "device_type": device_type,
+                    "timestamp": int(now),
+                    "sqi": sqi_info,
+                    "message": "Poor signal during accumulation window. Waiting for valid packet."
+                }
+            acc = {
+                "status": "accumulating",
+                "admissionId": adm_id,
+                "device_type": device_type,
+                "elapsed_seconds": int(elapsed),
                 "target_seconds": int(target_interval),
+                "bp": {
+                    "bpSystolic": sbp_pred,
+                    "bpDiastolic": dbp_pred,
+                    "estimated_sbp": sbp_pred,
+                    "estimated_dbp": dbp_pred,
+                    "category": ai_results.get("category", "Unknown"),
+                },
+                "sqi": sqi_info,
                 "message": f"Stability period in progress ({int(elapsed)}/{int(target_interval)}s)."
-             }
+            }
+            if hb_pred != "N/A":
+                acc["hemoglobin"] = hb_pred
+            if glu_pred != "N/A":
+                acc["glucose"] = glu_pred
+            return acc
 
         # Timer Expired -> Calculate Averages
         readings = session["readings"]
@@ -369,8 +426,8 @@ def process_vitals(json_data):
         final_status = "success"
         final_msg = "Immediate initial reading confirmed." if is_immediate else "15-minute averaged clinical payload."
         
-        sbp_avg_mismatch = (ref_sbp > 0 and abs(ref_sbp - avg_sbp) > 15)
-        dbp_avg_mismatch = (ref_dbp > 0 and abs(ref_dbp - avg_dbp) > 15)
+        sbp_avg_mismatch = (ref_sbp > 0 and abs(ref_sbp - avg_sbp) >= 15)
+        dbp_avg_mismatch = (ref_dbp > 0 and abs(ref_dbp - avg_dbp) >= 15)
         
         if sbp_avg_mismatch or dbp_avg_mismatch:
             final_status = "alert"

@@ -11,5 +11,6 @@ ENV/
 *.log
 *.png
 *.mp4
-test_app/
 *.pdf
+test_app/static/plots/
+test_app/

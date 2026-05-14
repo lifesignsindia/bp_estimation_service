@@ -78,3 +78,4 @@ REDIS_REF_TTL  = 86400  # 24 hours per clinical session
 KAFKA_BROKERS      = os.getenv("KAFKA_BROKERS",      "localhost:9092")
 KAFKA_INPUT_TOPIC  = os.getenv("KAFKA_INPUT_TOPIC",  "vitals.raw")
 KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "vitals.clinical")
+KAFKA_GROUP_ID     = os.getenv("KAFKA_GROUP_ID",     "vitals-pipeline")

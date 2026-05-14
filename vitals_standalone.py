@@ -148,7 +148,71 @@ def _preprocess_signal(raw_pleth, source_hz, target_hz, device_type):
     return list(clean_signal), sqi_info
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Main Processing Entry Point 
+# 4. Signal Analysis Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_aix(ppg, fs=120):
+    """SDPTG b/a ratio as Augmentation Index proxy. Returns None if signal insufficient."""
+    ppg = np.array(ppg, dtype=float)
+    if len(ppg) < fs * 3:
+        return None
+    rng = ppg.max() - ppg.min()
+    if rng < 1e-6:
+        return None
+    ppg_n = (ppg - ppg.min()) / rng
+    wl = max(5, min(15, (len(ppg_n) // 20) * 2 + 1))
+    ppg_s = signal.savgol_filter(ppg_n, window_length=wl, polyorder=3)
+    peaks, _ = signal.find_peaks(ppg_s, distance=int(fs * 0.4), height=0.4)
+    if len(peaks) < 3:
+        return None
+    d2 = np.diff(ppg_s, n=2)
+    ratios = []
+    for pk in peaks[:-1]:
+        s = max(0, pk - int(fs * 0.05))
+        e = min(len(d2), pk + int(fs * 0.4))
+        seg = d2[s:e]
+        if len(seg) < 8:
+            continue
+        h = len(seg) // 2
+        a_val = float(seg[:h].min())
+        b_val = float(seg[max(0, h // 4): h + h // 4 + 1].max())
+        if abs(a_val) > 1e-9:
+            ratios.append(b_val / a_val)
+    return float(np.median(ratios)) if len(ratios) >= 2 else None
+
+
+def _apply_bp_offset(sbp, dbp):
+    """Empirical bias correction for no-reference mode via smooth interpolation."""
+    offset_s = float(np.interp(sbp, [85.0, 100.0, 110.0], [25.0, 15.0, 0.0]))
+    offset_d = float(np.interp(dbp, [45.0, 60.0], [15.0, 0.0]))
+    return (int(round(float(np.clip(sbp + offset_s, *cfg.BP_SBP_LIMITS)))),
+            int(round(float(np.clip(dbp + offset_d, *cfg.BP_DBP_LIMITS)))))
+
+
+def _compute_trends(session):
+    """Returns (trending, morphology_change) from delta history and AIx history."""
+    trending   = False
+    morphology = "stable"
+    deltas   = session.get("deltas", [])
+    baseline = session.get("baseline_delta")
+    if baseline and len(deltas) >= 3:
+        recent_mean = float(np.mean([d[0] for d in deltas[-5:]]))
+        if abs(recent_mean - baseline[0]) >= 10.0:
+            trending = True
+    aix_history = session.get("aix_history", [])
+    aix_values  = session.get("aix_values",  [])
+    if aix_history and len(aix_values) >= 3:
+        current_aix = float(np.mean(aix_values[-5:]))
+        shift = current_aix - aix_history[0]
+        if shift > 0.15:
+            morphology = "rising"
+        elif shift < -0.15:
+            morphology = "falling"
+    return trending, morphology
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Main Processing Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 def process_vitals(json_data):
     """Takes JSON, identifies device, routes to DSP, and returns AI predictions."""
@@ -195,7 +259,11 @@ def process_vitals(json_data):
                 "is_first_reading": True,
                 "needs_recalibration": False,
                 "current_interval": 900,
-                "last_confirmation_time": 0
+                "last_confirmation_time": 0,
+                "deltas": [],
+                "baseline_delta": None,
+                "aix_values": [],
+                "aix_history": [],
             }
         else:
             SESSION_STORAGE[adm_id]["is_first_reading"] = True
@@ -243,6 +311,8 @@ def process_vitals(json_data):
     if len(model_ready_pleth) < 120:
         return {"status": "error", "message": "Signal too short for AI inference."}
 
+    pleth_out = [round(float(x), 6) for x in model_ready_pleth]
+
     # 2. Extract demographics for the AI
     age = json_data.get("Age", 35)
     gender = json_data.get("Gender", "Male")
@@ -270,12 +340,19 @@ def process_vitals(json_data):
         hb_pred  = ai_results.get("hb", "N/A") if bp_valid else "N/A"
         glu_pred = ai_results.get("glucose", "N/A") if bp_valid else "N/A"
 
-        # Reference-forced category correction: when a cuff reference is set,
-        # determine the true BP category from the reference and re-anchor the
-        # model's delta to the correct category base.
+        # Raw model delta for trend tracking (always computed before any correction)
+        model_cat_raw  = ai_results.get("category", "normal")
+        base_s_raw, base_d_raw = cfg.BP_CATEGORY_BASES.get(model_cat_raw, (118.0, 76.0))
+        pkt_delta_s = (float(ai_results["sbp"]) - base_s_raw) if bp_valid else None
+        pkt_delta_d = (float(ai_results["dbp"]) - base_d_raw) if bp_valid else None
+
+        # AIx from this packet
+        aix = _compute_aix(model_ready_pleth, fs=120)
+
+        # Two-path BP correction
+        ref_s = patient_ref.get("sbp", 0)
+        ref_d = patient_ref.get("dbp", 0)
         if bp_valid:
-            ref_s = patient_ref.get("sbp", 0)
-            ref_d = patient_ref.get("dbp", 0)
             if ref_s > 0 and ref_d > 0:
                 if ref_s < 90 or ref_d < 60:
                     ref_cat = "hypo"
@@ -283,14 +360,13 @@ def process_vitals(json_data):
                     ref_cat = "hyper"
                 else:
                     ref_cat = "normal"
-                model_cat = ai_results.get("category", "normal")
-                if model_cat != ref_cat:
-                    m_base_s, m_base_d = cfg.BP_CATEGORY_BASES.get(model_cat, (118.0, 76.0))
+                if model_cat_raw != ref_cat:
+                    m_base_s, m_base_d = cfg.BP_CATEGORY_BASES.get(model_cat_raw, (118.0, 76.0))
                     r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
-                    delta_s = sbp_pred - m_base_s
-                    delta_d = dbp_pred - m_base_d
-                    sbp_pred = int(round(float(np.clip(r_base_s + delta_s, *cfg.BP_SBP_LIMITS))))
-                    dbp_pred = int(round(float(np.clip(r_base_d + delta_d, *cfg.BP_DBP_LIMITS))))
+                    sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
+                    dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))
+            else:
+                sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
 
         print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
 
@@ -304,7 +380,11 @@ def process_vitals(json_data):
                 "is_first_reading": True,
                 "needs_recalibration": False,
                 "current_interval": 900,
-                "last_confirmation_time": 0
+                "last_confirmation_time": 0,
+                "deltas": [],
+                "baseline_delta": None,
+                "aix_values": [],
+                "aix_history": [],
             }
         
         session = SESSION_STORAGE[adm_id]
@@ -313,7 +393,8 @@ def process_vitals(json_data):
         # Rule: Alerts are only immediate for the FIRST reading.
         # Otherwise, they wait for the 15-minute average to confirm stability.
         # Skip calibration entirely if the AI had no valid signal — fallback values must never trigger alerts.
-        is_immediate = session["is_first_reading"] or session["needs_recalibration"]
+        has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0
+        is_immediate  = has_reference and (session["is_first_reading"] or session["needs_recalibration"])
 
         if is_immediate and not bp_valid:
             return {
@@ -328,19 +409,27 @@ def process_vitals(json_data):
         if is_immediate:
             ref_sbp = patient_ref.get("sbp", 0)
             ref_dbp = patient_ref.get("dbp", 0)
-            
-            # Check if either SBP or DBP is off by 15 mmHg or more
-            sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - sbp_pred) >= 15)
-            dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - dbp_pred) >= 15)
+
+            if ref_sbp > 0 or ref_dbp > 0:
+                sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - sbp_pred) >= 15)
+                dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - dbp_pred) >= 15)
+            else:
+                sbp_mismatch = (sbp_pred > 140 or sbp_pred < 90)
+                dbp_mismatch = (dbp_pred > 90  or dbp_pred < 60)
             
             if sbp_mismatch or dbp_mismatch:
                 session["needs_recalibration"] = True
+                alert_msg = (
+                    f"Physiological Alert: AI={sbp_pred}/{dbp_pred} outside normal range."
+                    if ref_sbp == 0 and ref_dbp == 0
+                    else f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={sbp_pred}/{dbp_pred}."
+                )
                 alert_payload = {
                     "status": "alert",
                     "admissionId": adm_id,
                     "device_type": device_type,
                     "timestamp": int(now),
-                    "message": f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={sbp_pred}/{dbp_pred}.",
+                    "message": alert_msg,
                     "bp": {
                         "bpSystolic": sbp_pred, "bpDiastolic": dbp_pred,
                         "estimated_sbp": sbp_pred, "estimated_dbp": dbp_pred,
@@ -349,7 +438,8 @@ def process_vitals(json_data):
                         "reference_sbp": ref_sbp,
                         "reference_dbp": ref_dbp
                     },
-                    "sqi": sqi_info
+                    "sqi": sqi_info,
+                    "pleth": pleth_out,
                 }
                 if hb_pred != "N/A":
                     alert_payload["hemoglobin"] = hb_pred
@@ -358,15 +448,19 @@ def process_vitals(json_data):
                 return alert_payload
 
         # 7. OUTPUT LOGIC (Immediate for First, 15-min Average for rest)
-        # Only accumulate real AI predictions — never store fallback values
         if bp_valid:
             session["readings"].append((sbp_pred, dbp_pred, hb_pred, glu_pred))
+            if pkt_delta_s is not None:
+                session["deltas"].append((pkt_delta_s, pkt_delta_d))
+        if aix is not None:
+            session["aix_values"].append(aix)
         
         # Check if current window interval has elapsed (Standard=900, Recovery=1200)
         target_interval = session.get("current_interval", 900)
         elapsed = now - session["start_time"]
         
         if not is_immediate and elapsed < target_interval:
+            trending, morphology = _compute_trends(session)
             if not bp_valid:
                 return {
                     "status": "poor_signal",
@@ -374,6 +468,8 @@ def process_vitals(json_data):
                     "device_type": device_type,
                     "timestamp": int(now),
                     "sqi": sqi_info,
+                    "trending": trending,
+                    "morphology_change": morphology,
                     "message": "Poor signal during accumulation window. Waiting for valid packet."
                 }
             acc = {
@@ -390,6 +486,9 @@ def process_vitals(json_data):
                     "category": ai_results.get("category", "Unknown"),
                 },
                 "sqi": sqi_info,
+                "trending": trending,
+                "morphology_change": morphology,
+                "pleth": pleth_out,
                 "message": f"Stability period in progress ({int(elapsed)}/{int(target_interval)}s)."
             }
             if hb_pred != "N/A":
@@ -398,7 +497,22 @@ def process_vitals(json_data):
                 acc["glucose"] = glu_pred
             return acc
 
-        # Timer Expired -> Calculate Averages
+        # Timer Expired -> Finalise window trends, then calculate averages
+        trending, morphology = _compute_trends(session)
+
+        aix_vals = session.get("aix_values", [])
+        if aix_vals:
+            session["aix_history"].append(float(np.mean(aix_vals)))
+        session["aix_values"] = []
+
+        window_deltas = session.get("deltas", [])
+        if window_deltas and session.get("baseline_delta") is None:
+            session["baseline_delta"] = (
+                float(np.mean([d[0] for d in window_deltas])),
+                float(np.mean([d[1] for d in window_deltas])),
+            )
+        session["deltas"] = []
+
         readings = session["readings"]
 
         if not readings:
@@ -414,6 +528,15 @@ def process_vitals(json_data):
 
         avg_sbp = int(np.mean([r[0] for r in readings]))
         avg_dbp = int(np.mean([r[1] for r in readings]))
+
+        if not has_reference and aix_vals and window_deltas:
+            mean_aix     = float(np.mean(aix_vals))
+            mean_delta_s = float(np.mean([d[0] for d in window_deltas]))
+            mean_delta_d = float(np.mean([d[1] for d in window_deltas]))
+            aix_cat = "hyper" if mean_aix > 0.0 else ("hypo" if mean_aix < -0.3 else "normal")
+            base_s, base_d = cfg.BP_CATEGORY_BASES[aix_cat]
+            avg_sbp = int(round(float(np.clip(base_s + mean_delta_s, *cfg.BP_SBP_LIMITS))))
+            avg_dbp = int(round(float(np.clip(base_d + mean_delta_d, *cfg.BP_DBP_LIMITS))))
         
         valid_hb = [r[2] for r in readings if isinstance(r[2], (int, float)) and r[2] != "N/A"]
         valid_glu = [r[3] for r in readings if isinstance(r[3], (int, float)) and r[3] != "N/A"]
@@ -426,8 +549,12 @@ def process_vitals(json_data):
         final_status = "success"
         final_msg = "Immediate initial reading confirmed." if is_immediate else "15-minute averaged clinical payload."
         
-        sbp_avg_mismatch = (ref_sbp > 0 and abs(ref_sbp - avg_sbp) >= 15)
-        dbp_avg_mismatch = (ref_dbp > 0 and abs(ref_dbp - avg_dbp) >= 15)
+        if ref_sbp > 0 or ref_dbp > 0:
+            sbp_avg_mismatch = (ref_sbp > 0 and abs(ref_sbp - avg_sbp) >= 15)
+            dbp_avg_mismatch = (ref_dbp > 0 and abs(ref_dbp - avg_dbp) >= 15)
+        else:
+            sbp_avg_mismatch = (avg_sbp > 140 or avg_sbp < 90)
+            dbp_avg_mismatch = (avg_dbp > 90  or avg_dbp < 60)
         
         if sbp_avg_mismatch or dbp_avg_mismatch:
             final_status = "alert"
@@ -469,6 +596,9 @@ def process_vitals(json_data):
                 "bpErrorMsg": "None"
             },
             "sqi": sqi_info,
+            "trending": trending,
+            "morphology_change": morphology,
+            "pleth": pleth_out,
             "message": final_msg
         }
         if avg_hb != "N/A":

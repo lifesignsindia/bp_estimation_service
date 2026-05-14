@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+ENV PYTHONUNBUFFERED=1
+
 ENV KAFKA_BROKERS=kafka:9092
 ENV KAFKA_INPUT_TOPIC=vitals.raw
 ENV KAFKA_OUTPUT_TOPIC=vitals.clinical

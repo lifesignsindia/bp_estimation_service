@@ -1,0 +1,223 @@
+name: EKS CICD Workflow
+
+on:
+  push:
+    branches: [eks-qa, eks-prod, eks-dev]
+
+permissions:
+  id-token: write # This is required for requesting the JWT
+  contents: read # used for checkout
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure Dev AWS Credentials
+        if: github.ref == 'refs/heads/eks-dev'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::702603886467:role/bp-detection-service-eks-dev-github-actions-cicd-role
+          role-session-name: GitHub_To_AWS_From_bp_detection_Repository_Workflow
+          aws-region: ap-south-1
+          
+      - name: Configure stage AWS Credentials
+        if: github.ref == 'refs/heads/eks-qa'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::702603886467:role/bp-detection-service-eks-qa-github-actions-cicd-role
+          role-session-name: GitHub_To_AWS_From_bp_detection_Repository_Workflow
+          aws-region: ap-south-1
+
+      - name: Configure Production AWS Credentials
+        if: github.ref == 'refs/heads/eks-prod'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::100403449615:role/bp-detection-service-eks-prod-github-actions-cicd-role
+          role-session-name: GitHub_To_AWS_From_bp_detection_Repository_Workflow
+          aws-region: ap-south-1
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set outputs
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d-${{ env.sha_short }}')" >> $GITHUB_ENV
+
+      - name: Build Project for EKS DEV
+        if: github.ref == 'refs/heads/eks-dev'
+        run: |
+          docker build -t dev-bp-detection-service .
+          
+      - name: Build Project for EKS QA
+        if: github.ref == 'refs/heads/eks-qa'
+        run: |
+          docker build -t qa-bp-detection-service .
+
+      - name: Build Project for EKS PROD
+        if: github.ref == 'refs/heads/eks-prod'
+        run: |
+          docker build -t prod-bp-detection-service .
+
+      - name: Tag, and push image to Dev Amazon ECR..
+        if: github.ref == 'refs/heads/eks-dev'
+        run: |
+          docker tag dev-bp-detection-service:latest ${{ steps.ecr.outputs.registry }}/dev-bp-detection-service:${{ env.date }}
+          docker push ${{ steps.ecr.outputs.registry }}/dev-bp-detection-service:${{ env.date }}
+
+      - name: Tag, and push image to QA Amazon ECR..
+        if: github.ref == 'refs/heads/eks-qa'
+        run: |
+          docker tag qa-bp-detection-service:latest ${{ steps.ecr.outputs.registry }}/qa-bp-detection-service:${{ env.date }}
+          docker push ${{ steps.ecr.outputs.registry }}/qa-bp-detection-service:${{ env.date }}
+
+      - name: Tag, and push image to PROD Amazon ECR..
+        if: github.ref == 'refs/heads/eks-prod'
+        run: |
+          docker tag prod-bp-detection-service:latest ${{ steps.ecr.outputs.registry }}/prod-bp-detection-service:${{ env.date }}
+          docker push ${{ steps.ecr.outputs.registry }}/prod-bp-detection-service:${{ env.date }}
+          
+      - uses: actions/checkout@v3
+        with:
+          repository: lifesignsindia/eks-apps-configs
+          ref: main
+          path: cicd-repo
+          token: ${{ secrets.CI_CD_TOKEN }}
+
+      - name: Change Dev Yaml
+        if: github.ref == 'refs/heads/eks-dev'
+        shell: bash
+        env:
+          FILEPATH: ls-nexus-eks-DEV/bp-detection-service/deployment.yaml
+          YAMLPATH: .spec.template.spec.containers[0].image
+          NEWVALUE: ${{ steps.ecr.outputs.registry }}/dev-bp-detection-service:${{ env.date }}
+        run: |
+          yq -i "${YAMLPATH} = \"${NEWVALUE}\"" cicd-repo/${FILEPATH}
+          
+      - name: Change QA Yaml
+        if: github.ref == 'refs/heads/eks-qa'
+        shell: bash
+        env:
+          FILEPATH: ls-nexus-eks-QA/bp-detection-service/deployment.yaml
+          YAMLPATH: .spec.template.spec.containers[0].image
+          NEWVALUE: ${{ steps.ecr.outputs.registry }}/qa-bp-detection-service:${{ env.date }}
+        run: |
+          yq -i "${YAMLPATH} = \"${NEWVALUE}\"" cicd-repo/${FILEPATH}
+
+      - name: Change Prod Yaml
+        if: github.ref == 'refs/heads/eks-prod'
+        shell: bash
+        env:
+          FILEPATH: ls-nexus-eks-PROD/bp-detection-service/deployment.yaml
+          YAMLPATH: .spec.template.spec.containers[0].image
+          NEWVALUE: ${{ steps.ecr.outputs.registry }}/prod-bp-detection-service:${{ env.date }}
+        run: |
+          yq -i "${YAMLPATH} = \"${NEWVALUE}\"" cicd-repo/${FILEPATH}
+
+      - name: Commit and Push DEV Changes
+        if: github.ref == 'refs/heads/eks-dev'
+        working-directory: cicd-repo
+        shell: bash
+        env:
+          COMMITPREFIX: 'GitHub-Action - '
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git add ls-nexus-eks-DEV/bp-detection-service/deployment.yaml || {
+            echo "No files were changed, so we did not commit anything"
+            exit 1
+          } && \
+          git commit -m "$COMMITPREFIX Automated changes to ls-nexus-eks-DEV/bp-detection-service/deployment.yaml" && \
+          git push origin main
+          
+      - name: Commit and Push QA Changes
+        if: github.ref == 'refs/heads/eks-qa'
+        working-directory: cicd-repo
+        shell: bash
+        env:
+          COMMITPREFIX: 'GitHub-Action - '
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git add ls-nexus-eks-QA/bp-detection-service/deployment.yaml || {
+            echo "No files were changed, so we did not commit anything"
+            exit 1
+          } && \
+          git commit -m "$COMMITPREFIX Automated changes to ls-nexus-eks-QA/bp-detection-service/deployment.yaml" && \
+          git push origin main
+          
+      - name: Commit and Push PROD Changes
+        if: github.ref == 'refs/heads/eks-prod'
+        working-directory: cicd-repo
+        shell: bash
+        env:
+          COMMITPREFIX: 'GitHub-Action - '
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git add ls-nexus-eks-PROD/bp-detection-service/deployment.yaml || {
+            echo "No files were changed, so we did not commit anything"
+            exit 1
+          } && \
+          git commit -m "$COMMITPREFIX Automated changes to ls-nexus-eks-PROD/bp-detection-service/deployment.yaml" && \
+          git push origin main
+
+
+  # pd_alert:
+  #   name: PD ALERT
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   if: ${{ always() }}
+  #   steps:
+  #     - name: check build result
+  #       run: |
+  #         echo "Build result: ${{ needs.build.result }}"
+  #     - name: Trigger PD on failure
+  #       env:
+  #         PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+  #         BUILD_RESULT: ${{ needs.build.result }}
+  #       run: |
+  #         if [ "${BUILD_RESULT}" != "failure" ]; then
+  #           echo "Not a failure, skipping"
+  #           exit 0
+  #         fi
+
+  #         if [ -z "${PAGERDUTY_ROUTING_KEY}" ]; then
+  #           echo "ERROR: No routing key"
+  #           exit 1
+  #         fi
+
+
+  #         # send to PagerDuty
+  #         curl -sS -X POST "https://events.pagerduty.com/v2/enqueue" \
+  #           -H "Content-Type: application/json" \
+  #           -d '{
+  #             "routing_key": "'"${PAGERDUTY_ROUTING_KEY}"'",
+  #             "event_action": "trigger",
+  #             "payload": {
+  #               "summary": "Build failed: ${{ github.repository }} – workflow ${{ github.workflow }} run ${{ github.run_number }} (run ID ${{ github.run_id }})",
+  #               "severity": "error",
+  #               "source": "${{ github.repository }}",
+  #               "component": "GitHub Actions Workflow",
+  #               "group": "CI/CD",
+  #               "class": "build failure",
+  #               "custom_details": {
+  #                 "workflow": "${{ github.workflow }}",
+  #                 "run_number": "${{ github.run_number }}",
+  #                 "run_id": "${{ github.run_id }}",
+  #                 "branch": "${{ github.ref }}",
+  #                 "actor": "${{ github.actor }}",
+  #                 "run_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+  #               }
+  #             }
+  #           }' \
+  #           -w "\nHTTP_STATUS:%{http_code}\n" -o /tmp/pd_resp.txt
+
+  #         cat /tmp/pd_resp.txt

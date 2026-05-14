@@ -44,9 +44,15 @@ PROCESSORS = {
 
 # Constants
 DEVICE_NISO204  = "NISO204"
-DEVICE_CHECKME  = "CHECKME"   
-DEVICE_BERRYMED = "BERRYMED"  
-DEVICE_LS06     = "LS06"      
+DEVICE_CHECKME  = "CHECKME"
+DEVICE_BERRYMED = "BERRYMED"
+DEVICE_LS06     = "LS06"
+
+_DEVICE_NAME_MAP = {
+    "BERRYMED": "NISO101",
+    "CHECKME":  "NISO103",
+    "NISO204":  "NISO204",
+}      
 
 # ─── Redis — Reference BP store (keyed by admissionId) ──────────────────────
 _redis = redis_lib.Redis(
@@ -68,6 +74,13 @@ def _ref_write(adm_id, sbp, dbp, timestamp):
 def _ref_read(adm_id):
     raw = _redis.get(f"ref:{adm_id}")
     return json.loads(raw) if raw else {"sbp": 0, "dbp": 0}
+
+def _recal_write(adm_id, value):
+    _redis.setex(f"recal:{adm_id}", cfg.REDIS_REF_TTL, "1" if value else "0")
+
+def _recal_read(adm_id):
+    raw = _redis.get(f"recal:{adm_id}")
+    return raw == "1" if raw else False
 
 # Session Storage to accumulate readings for 15-minute averaging
 # Structure: { admissionId: {
@@ -253,12 +266,13 @@ def process_vitals(json_data):
         # Every time a new reference comes, we want to trigger an immediate 
         # AI confirmation on the next pleth packet, bypassing the 15-min timer.
         if adm_id not in SESSION_STORAGE:
+            _needs_recal = _recal_read(adm_id)
             SESSION_STORAGE[adm_id] = {
                 "start_time": time.time(),
                 "readings": [],
                 "is_first_reading": True,
-                "needs_recalibration": False,
-                "current_interval": 900,
+                "needs_recalibration": _needs_recal,
+                "current_interval": 1200 if _needs_recal else 900,
                 "last_confirmation_time": 0,
                 "deltas": [],
                 "baseline_delta": None,
@@ -292,7 +306,7 @@ def process_vitals(json_data):
         raw_pleth = json_data.get("pleth", {}).get("plethWave", [])
         actual_hz = 125 if device_type == DEVICE_CHECKME else 200
     else:
-        return {"status": "error", "message": f"Unknown device format for {device_type}."}
+        return {"status": "error", "admissionId": adm_id, "message": f"Unknown device format for {device_type}."}
 
     # 1. Clean and enforce 120Hz
     model_ready_pleth, sqi_info = _preprocess_signal(raw_pleth, actual_hz, 120, device_type)
@@ -302,7 +316,8 @@ def process_vitals(json_data):
         return {
             "status": "poor_signal",
             "admissionId": adm_id,
-            "device_type": device_type,
+            "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
+            "device_type": "BP_SPO2",
             "timestamp": int(time.time()),
             "sqi": sqi_info,
             "message": f"Poor signal quality ({sqi_flag}). Skipping inference."
@@ -374,12 +389,13 @@ def process_vitals(json_data):
         now = time.time()
         
         if adm_id not in SESSION_STORAGE:
+            _needs_recal = _recal_read(adm_id)
             SESSION_STORAGE[adm_id] = {
                 "start_time": now,
                 "readings": [],
                 "is_first_reading": True,
-                "needs_recalibration": False,
-                "current_interval": 900,
+                "needs_recalibration": _needs_recal,
+                "current_interval": 1200 if _needs_recal else 900,
                 "last_confirmation_time": 0,
                 "deltas": [],
                 "baseline_delta": None,
@@ -400,7 +416,8 @@ def process_vitals(json_data):
             return {
                 "status": "poor_signal",
                 "admissionId": adm_id,
-                "device_type": device_type,
+                "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
+            "device_type": "BP_SPO2",
                 "timestamp": int(now),
                 "sqi": sqi_info,
                 "message": "Poor signal on first/recalibration packet. Waiting for clean signal before calibration check."
@@ -419,6 +436,7 @@ def process_vitals(json_data):
             
             if sbp_mismatch or dbp_mismatch:
                 session["needs_recalibration"] = True
+                _recal_write(adm_id, True)
                 alert_msg = (
                     f"Physiological Alert: AI={sbp_pred}/{dbp_pred} outside normal range."
                     if ref_sbp == 0 and ref_dbp == 0
@@ -427,7 +445,8 @@ def process_vitals(json_data):
                 alert_payload = {
                     "status": "alert",
                     "admissionId": adm_id,
-                    "device_type": device_type,
+                    "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
+            "device_type": "BP_SPO2",
                     "timestamp": int(now),
                     "message": alert_msg,
                     "bp": {
@@ -465,17 +484,20 @@ def process_vitals(json_data):
                 return {
                     "status": "poor_signal",
                     "admissionId": adm_id,
-                    "device_type": device_type,
+                    "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
+            "device_type": "BP_SPO2",
                     "timestamp": int(now),
                     "sqi": sqi_info,
                     "trending": trending,
                     "morphology_change": morphology,
+                    "pleth": pleth_out,
                     "message": "Poor signal during accumulation window. Waiting for valid packet."
                 }
             acc = {
                 "status": "accumulating",
                 "admissionId": adm_id,
-                "device_type": device_type,
+                "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
+            "device_type": "BP_SPO2",
                 "elapsed_seconds": int(elapsed),
                 "target_seconds": int(target_interval),
                 "bp": {
@@ -520,9 +542,11 @@ def process_vitals(json_data):
             return {
                 "status": "poor_signal",
                 "admissionId": adm_id,
-                "device_type": device_type,
+                "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
+            "device_type": "BP_SPO2",
                 "timestamp": int(now),
                 "sqi": sqi_info,
+                "pleth": pleth_out,
                 "message": "No valid signal in window. All packets had poor signal quality."
             }
 
@@ -560,8 +584,10 @@ def process_vitals(json_data):
             final_status = "alert"
             final_msg = f"Averaged Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI_Avg={avg_sbp}/{avg_dbp}."
             session["needs_recalibration"] = True
+            _recal_write(adm_id, True)
         else:
             session["needs_recalibration"] = False
+            _recal_write(adm_id, False)
 
         # Reset Session State
         # Only start the 15-minute cooldown timer if there is NO mismatch (successful calibration).
@@ -583,7 +609,8 @@ def process_vitals(json_data):
         final_payload = {
             "status": final_status,
             "admissionId": adm_id,
-            "device_type": device_type,
+            "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
+            "device_type": "BP_SPO2",
             "timestamp": int(now),
             "reading_count": len(readings),
             "bp": {
@@ -611,7 +638,7 @@ def process_vitals(json_data):
         if adm_id in SESSION_STORAGE:
             SESSION_STORAGE[adm_id]["readings"] = []
             SESSION_STORAGE[adm_id]["start_time"] = time.time()
-        return {"status": "error", "message": f"AI Inference Failed: {str(e)}"}
+        return {"status": "error", "admissionId": adm_id, "message": f"AI Inference Failed: {str(e)}"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. CLI Test Block

@@ -28,8 +28,8 @@ load_dotenv()
 import config as cfg
 from vitals_standalone import process_vitals
 
-# ─── Forward statuses ────────────────────────────────────────────────────────
-FORWARD_STATUSES = {"success", "alert", "accumulating"}
+# ─── Forward statuses (downstream clinical output only) ──────────────────────
+FORWARD_STATUSES = {"success", "alert"}
 
 # ─── Kafka Consumer ───────────────────────────────────────────────────────────
 consumer = Consumer({
@@ -59,12 +59,6 @@ def _delivery_cb(err, msg):
     if err:
         print(f"[KAFKA] Delivery FAILED | topic={msg.topic()} | err={err}")
 
-
-def _strip_pleth(result: dict) -> dict:
-    """Remove pleth array before sending over Kafka — too large for message bus."""
-    out = dict(result)
-    out.pop("pleth", None)
-    return out
 
 
 # ─── Graceful shutdown ────────────────────────────────────────────────────────
@@ -113,7 +107,7 @@ def run():
         adm_id = result.get("admissionId", "UNKNOWN")
 
         if status in FORWARD_STATUSES:
-            out = _strip_pleth(result)
+            out = result
             producer.produce(
                 cfg.KAFKA_OUTPUT_TOPIC,
                 key=adm_id.encode("utf-8"),
@@ -124,9 +118,31 @@ def run():
             if _flush_counter >= _FLUSH_EVERY:
                 producer.flush()
                 _flush_counter = 0
-            print(f"[KAFKA] Forwarded  | adm={adm_id} | status={status}")
+            dev  = result.get("device_type", "-")
+            bp   = result.get("bp", {})
+            sbp  = bp.get("bpSystolic",  "-")
+            dbp  = bp.get("bpDiastolic", "-")
+            print(f"[OUT]  {status.upper():<8} | adm={adm_id} | dev={dev} | BP={sbp}/{dbp} | {result.get('message','')}")
+
+        elif status == "accumulating":
+            bp      = result.get("bp", {})
+            elapsed = result.get("elapsed_seconds", "-")
+            target  = result.get("target_seconds",  "-")
+            print(f"[ACC]  {elapsed:>4}s/{target}s | adm={adm_id} | BP={bp.get('bpSystolic','-')}/{bp.get('bpDiastolic','-')} | trending={result.get('trending',False)}")
+
+        elif status == "poor_signal":
+            sqi  = result.get("sqi", {})
+            flag = sqi.get("flag", "-")
+            print(f"[SIG]  POOR_SIGNAL  | adm={adm_id} | dev={result.get('device_type','-')} | flag={flag}")
+
+        elif status == "ignored":
+            print(f"[IGN]  IGNORED      | adm={adm_id} | {result.get('message','')}")
+
+        elif status == "error":
+            print(f"[ERR]  ERROR        | adm={adm_id} | {result.get('message','')}")
+
         else:
-            print(f"[KAFKA] Suppressed | adm={adm_id} | status={status} | {result.get('message', '')}")
+            print(f"[???]  {status:<12} | adm={adm_id} | {result.get('message','')}")
 
     producer.flush()
     consumer.close()

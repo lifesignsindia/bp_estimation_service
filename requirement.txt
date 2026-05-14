@@ -1,0 +1,7 @@
+numpy
+scipy
+joblib
+scikit-learn
+confluent-kafka
+redis
+savgol-filter

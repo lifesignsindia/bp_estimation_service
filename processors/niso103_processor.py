@@ -118,9 +118,8 @@ def compute_signal_quality(cleaned, filtered, fs=120):
 
 
 class PlethProcessor:
-    def __init__(self, fs=120, target_fs=240):
+    def __init__(self, fs=120):
         self.fs = fs
-        self.target_fs = target_fs
         
     def process_data(self, raw_data, override_fs=None):
         """
@@ -133,7 +132,7 @@ class PlethProcessor:
         bad_quality = {"score": 0.0, "valid": False, "flag": "INSUFFICIENT_DATA", "ac_amplitude": 0.0}
         
         if len(raw_data) < fs: # require at least 1s of data
-            return empty, empty, empty, empty, empty, empty, bad_quality
+            return empty, empty, empty, empty, bad_quality
 
         # 1. Enhanced Sentinel clean
         cleaned = clean_checkme_sentinel(raw_data)
@@ -169,12 +168,7 @@ class PlethProcessor:
 
         t_axis = np.linspace(0, len(normalised) / fs, len(normalised))
 
-        # 7. Upsample ONLY for display
-        x_new = np.linspace(0, t_axis[-1], int(len(normalised) * (self.target_fs / fs)))
-        cs = CubicSpline(t_axis, normalised)
-        display = np.clip(cs(x_new), 0, 1)
-
-        return normalised, t_axis, denoised, filtered, display, x_new, quality_info
+        return normalised, t_axis, denoised, filtered, quality_info
 
     def process_niso103_payload(self, payload):
         """
@@ -194,7 +188,7 @@ class PlethProcessor:
 
         # Run pipeline with the detected frequency
         results = self.process_data(pleth_data, override_fs=detected_fs)
-        normalised, t_axis, _, _, _, _, quality = results
+        normalised, t_axis, _, _, quality = results
         
         pr_list = payload.get('spo2', {}).get('pulseRate', [])
         sp_list = payload.get('spo2', {}).get('spo2', [])

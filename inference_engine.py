@@ -22,6 +22,9 @@ class GenericTrendTracker:
         if value is None or np.isnan(value):
             return
         self._history.append(value)
+        # Limit history to the window size to ensure trend sensitivity
+        if len(self._history) > self._window:
+            self._history = self._history[-self._window:]
 
     def get_trend(self):
         n = len(self._history)
@@ -38,7 +41,7 @@ class VitalInferenceEngine:
     def __init__(self):
         self.models = {}
         self._load_models()
-        self.trend_tracker = GenericTrendTracker()
+        self._trend_trackers = {}  # keyed by admissionId
 
     def _load_models(self):
         """Automatically loads all .pkl files mapped in config.py"""
@@ -91,9 +94,13 @@ class VitalInferenceEngine:
             # APG Features (a, b, c, d, e waves)
             a_wave = np.max(apg)
             b_wave = np.min(apg)
-            c_wave = a_wave * 0.2  # Approximate if dicrotic notch is subtle
-            d_wave = b_wave * 0.1
-            e_wave = a_wave * 0.15
+            # Genuine signal-derived APG distributions instead of hardcoded synthetic fractions.
+            # Using percentiles of the APG to capture secondary wave morphology organically.
+            pos_apg = apg[apg > 0]
+            neg_apg = apg[apg < 0]
+            c_wave = np.percentile(pos_apg, 75) if len(pos_apg) > 0 else 0
+            d_wave = -np.percentile(np.abs(neg_apg), 75) if len(neg_apg) > 0 else 0
+            e_wave = np.percentile(pos_apg, 25) if len(pos_apg) > 0 else 0
             
             # APG Ratios (Vascular Aging Indices)
             b_a_ratio = b_wave / a_wave if a_wave != 0 else 0
@@ -145,102 +152,173 @@ class VitalInferenceEngine:
             features[22] = peak_freq
             features[23] = power_total
             features[24] = spectral_centroid
-            # Pad the remaining 6 to reach 31 (These would traditionally be specific sub-bands)
-            features[25:31] = [np.median(smoothed), np.var(smoothed), np.max(vpg)-np.min(vpg), a_wave-b_wave, hr*std_val, hr/std_val if std_val > 0 else 0]
+            # Genuine Frequency Sub-Bands (Power in specific physiological Hz ranges)
+            band1 = np.sum(fft_vals[(freqs > 0) & (freqs <= 0.5)]**2)    # VLF
+            band2 = np.sum(fft_vals[(freqs > 0.5) & (freqs <= 1.5)]**2)  # LF (Heart rate range)
+            band3 = np.sum(fft_vals[(freqs > 1.5) & (freqs <= 3.0)]**2)  # HF
+            band4 = np.sum(fft_vals[(freqs > 3.0) & (freqs <= 8.0)]**2)  # VHF
+            band5 = np.sum(fft_vals[(freqs > 8.0) & (freqs <= 20.0)]**2) # High1
+            band6 = np.sum(fft_vals[(freqs > 20.0)]**2)                  # High2
+            features[25:31] = [band1, band2, band3, band4, band5, band6]
 
             return features
         except Exception as e:
             print(f"Feature Extraction Error: {e}")
             return features
 
-    def analyze(self, pleth_array, fs=120, age=35, gender="Male", bmi=24, offsets=None):
-        """Main inference function called by vitals_standalone.py."""
-        results = {
-            "bp": "Unknown", 
-            "category": "Unknown", 
-            "hb": "N/A", 
-            "glucose": "N/A",
-            "signal_quality": "Good",
-            "valid_segments": 1,
-            "total_segments": 1
-        }
+    def _is_noisy(self, segment, fs=120):
+        """
+        The noise gate from danger.py.
+        Checks for flat lines, saturation, and physiological feasibility.
+        """
+        if len(segment) < fs * 2: 
+            return True
         
-        try:
-            # 1. Feature Extraction (Guaranteed to be 120Hz at this point)
-            features = self._extract_31_features(pleth_array, fs)
-            features_2d = features.reshape(1, -1)
+        # 1. Flat line check
+        if np.max(segment) - np.min(segment) < 0.05: 
+            return True
+        
+        # 2. Saturation/Clipping check
+        # If more than 20% of the signal is "stuck" at the rails (0 or 1)
+        if np.mean(segment > 0.95) > 0.2 or np.mean(segment < 0.05) > 0.2: 
+            return True
+        
+        # 3. Frequency check (FFT)
+        # Ensure the power is primarily in the human heart-rate range (0.5 - 4.0 Hz)
+        fft_vals = np.abs(fft(segment))
+        freqs = np.fft.fftfreq(len(segment), 1/fs)
+        hr_mask = (freqs >= 0.5) & (freqs <= 4.0)
+        hr_power = np.sum(fft_vals[hr_mask])
+        total_power = np.sum(fft_vals[freqs > 0])
+        
+        if total_power == 0 or (hr_power / total_power) < 0.3:
+            return True
             
-            # Ensure features are valid (not all zeros)
-            if np.all(features == 0):
-                results["signal_quality"] = "Poor"
-                return results
+        return False
 
-            # 2. BLOOD PRESSURE INFERENCE (Two-Step Pipeline)
-            if "classifier" in self.models and "global_scaler" in self.models:
-                # Step 2A: Scale and Classify
-                X_scaled = self.models["global_scaler"].transform(features_2d)
-                
-                # Handle dangerr_v2 format (where classifier is a bundle dict)
-                clf_bundle = self.models["classifier"]
-                if isinstance(clf_bundle, dict) and "model" in clf_bundle:
-                    clf = clf_bundle["model"]
-                    cat_int = clf.predict(X_scaled)[0]
-                    category = clf_bundle["int_to_label"].get(cat_int, "normal")
-                else:
-                    # Standard Scikit-Learn Model
-                    category = clf_bundle.predict(X_scaled)[0]
+    def _run_bp_logic(self, features_2d):
+        """Internal BP pipeline: Scale -> Classify -> Specific Regression."""
+        if "classifier" not in self.models or "global_scaler" not in self.models:
+            return None, None, "Unknown"
 
-                results["category"] = str(category).title()
+        # 1. Scale and Classify
+        X_scaled = self.models["global_scaler"].transform(features_2d)
+        clf_bundle = self.models["classifier"]
+        
+        if isinstance(clf_bundle, dict) and "model" in clf_bundle:
+            cat_int = clf_bundle["model"].predict(X_scaled)[0]
+            category = clf_bundle["int_to_label"].get(cat_int, "normal")
+        else:
+            category = clf_bundle.predict(X_scaled)[0]
 
-                # Step 2B: Route to Specific Regressor (Hypo, Normal, Hyper)
-                cat_lower = str(category).lower()
-                reg_key = f"{cat_lower}"
-                scaler_key = f"scaler_{cat_lower}"
+        # 2. Regression
+        cat_lower = str(category).lower()
+        reg_key = f"{cat_lower}"
+        scaler_key = f"scaler_{cat_lower}"
 
-                if reg_key in self.models and scaler_key in self.models:
-                    # The models dict saved from danger.py has 'sbp_model' and 'dbp_model'
-                    X_cat_scaled = self.models[scaler_key].transform(features_2d)
-                    
-                    reg_bundle = self.models[reg_key]
-                    sbp = reg_bundle['sbp_model'].predict(X_cat_scaled)[0]
-                    dbp = reg_bundle['dbp_model'].predict(X_cat_scaled)[0]
-                    
-                    results["bp"] = f"{int(round(sbp))}/{int(round(dbp))}"
-                else:
-                    print(f"Warning: Regressor for category '{cat_lower}' not found.")
+        if reg_key in self.models and scaler_key in self.models:
+            X_cat_scaled = self.models[scaler_key].transform(features_2d)
+            reg_bundle = self.models[reg_key]
+            sbp = reg_bundle['sbp_model'].predict(X_cat_scaled)[0]
+            dbp = reg_bundle['dbp_model'].predict(X_cat_scaled)[0]
+            return sbp, dbp, str(category).title()
+        
+        return None, None, str(category).title()
 
-            # 3. DEMOGRAPHICS FOR HB/GLUCOSE
-            age_val    = float(age) if (age and 0 < float(age) < 120) else 35.0
-            gender_bin = 1.0        if str(gender).lower() == "male" else 0.0
-            bmi_val    = float(bmi) if (bmi and 10 < float(bmi) < 80) else 24.0
+    def _run_hb_glu_logic(self, features, age, gender, bmi, offsets=None):
+        """Internal Hb/Glucose pipeline using demographics."""
+        age_val    = float(age) if (age and 0 < float(age) < 120) else 35.0
+        gender_bin = 1.0        if str(gender).lower() == "male" else 0.0
+        bmi_val    = float(bmi) if (bmi and 10 < float(bmi) < 80) else 24.0
+        
+        demo = [age_val, age_val**2, 1.0 if age_val > 60 else 0.0, gender_bin, age_val * gender_bin, bmi_val]
+        hg_features = list(features[:21]) + demo
+        hg_features_2d = np.array(hg_features, dtype=float).reshape(1, -1)
+
+        hb_res, glu_res = None, None
+
+        if "hb_model" in self.models and "hb_scaler" in self.models:
+            X_hb = self.models["hb_scaler"].transform(hg_features_2d)
+            hb_val = float(self.models["hb_model"].predict(X_hb)[0])
+            if offsets: hb_val += offsets.get('hb', 0.0)
+            hb_res = round(max(8.0, min(20.0, hb_val)), 1)
+
+        if "glucose_model" in self.models and "glucose_scaler" in self.models:
+            X_glu = self.models["glucose_scaler"].transform(hg_features_2d)
+            glu_val = float(self.models["glucose_model"].predict(X_glu)[0])
+            if offsets: glu_val += offsets.get('glucose', 0.0)
+            glu_res = int(round(max(40.0, min(400.0, glu_val))))
+
+        return hb_res, glu_res
+
+    def analyze(self, pleth_array, fs=120, age=35, gender="Male", bmi=24, offsets=None, adm_id="UNKNOWN"):
+        """
+        Segmented inference: splits 30s into 5s windows to match training.
+        Aggregates results using Median for robustness.
+        """
+        if adm_id not in self._trend_trackers:
+            self._trend_trackers[adm_id] = GenericTrendTracker()
+        trend_tracker = self._trend_trackers[adm_id]
+
+        results = {
+            "bp": "Unknown", "category": "Unknown", "hb": "N/A", "glucose": "N/A",
+            "signal_quality": "Good", "trend": trend_tracker.get_trend(),
+            "valid_segments": 0, "total_segments": 0
+        }
+
+        seg_len = 5 * fs  # 5 seconds per segment (600 samples)
+        total_segments = len(pleth_array) // seg_len
+        results["total_segments"] = total_segments
+
+        sbp_list, dbp_list, hb_list, glu_list, cat_list = [], [], [], [], []
+
+        for i in range(total_segments):
+            segment = pleth_array[i*seg_len : (i+1)*seg_len]
             
-            # Demographic feature vector from your hbglucose script
-            demo = [age_val, age_val**2, 1.0 if age_val > 60 else 0.0, gender_bin, age_val * gender_bin, bmi_val]
+            # 1. Noise Gating
+            if self._is_noisy(segment, fs):
+                continue
+
+            # 2. Feature Extraction
+            features = self._extract_31_features(segment, fs)
+            if np.all(features == 0): 
+                continue
             
-            # For this pipeline, we use the first 21 APG features + 6 Demographics = 27 features
-            hg_features = list(features[:21]) + demo
-            hg_features_2d = np.array(hg_features, dtype=float).reshape(1, -1)
+            # 3. Model Execution
+            sbp, dbp, category = self._run_bp_logic(features.reshape(1, -1))
+            hb, glu = self._run_hb_glu_logic(features, age, gender, bmi, offsets)
 
-            # 4. HEMOGLOBIN INFERENCE
-            if "hb_model" in self.models and "hb_scaler" in self.models:
-                X_hb = self.models["hb_scaler"].transform(hg_features_2d)
-                hb_val = float(self.models["hb_model"].predict(X_hb)[0])
-                
-                if offsets:
-                    hb_val += offsets.get('hb', 0.0)
-                results["hb"] = round(max(8.0, min(20.0, hb_val)), 1) # Clamp to physiological bounds
+            if sbp is not None:
+                sbp_list.append(sbp)
+                dbp_list.append(dbp)
+                cat_list.append(category)
+            if hb is not None: 
+                hb_list.append(hb)
+            if glu is not None: 
+                glu_list.append(glu)
 
-            # 5. GLUCOSE INFERENCE
-            if "glucose_model" in self.models and "glucose_scaler" in self.models:
-                X_glu = self.models["glucose_scaler"].transform(hg_features_2d)
-                glu_val = float(self.models["glucose_model"].predict(X_glu)[0])
-                
-                if offsets:
-                    glu_val += offsets.get('glucose', 0.0)
-                results["glucose"] = int(round(max(40.0, min(400.0, glu_val)))) # Clamp bounds
+        # 4. Aggregation (Median)
+        valid_count = len(sbp_list)
+        results["valid_segments"] = valid_count
 
-        except Exception as e:
-            print(f"Error during AI inference execution: {e}")
-            results["signal_quality"] = "Error"
-            
-        return results
+        if valid_count == 0:
+            results["signal_quality"] = "Poor"
+            return results
+
+        final_sbp = np.median(sbp_list)
+        final_dbp = np.median(dbp_list)
+        
+        trend_tracker.update(final_sbp)
+
+        results.update({
+            "bp": f"{int(round(final_sbp))}/{int(round(final_dbp))}",
+            "sbp": final_sbp,
+            "dbp": final_dbp,
+            "category": max(set(cat_list), key=cat_list.count) if cat_list else "Unknown",
+            "hb": round(np.median(hb_list), 1) if hb_list else "N/A",
+            "glucose": int(np.median(glu_list)) if glu_list else "N/A",
+            "signal_quality": "Good" if valid_count >= (total_segments // 2) else "Fair",
+            "trend": trend_tracker.get_trend()
+        })
+
+        return results

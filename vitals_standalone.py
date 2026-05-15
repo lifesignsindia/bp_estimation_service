@@ -323,6 +323,27 @@ def process_vitals(json_data):
             "message": f"Poor signal quality ({sqi_flag}). Skipping inference."
         }
 
+    if len(model_ready_pleth) > 0:
+        _arr = np.array(model_ready_pleth)
+        # Check last 66% of signal — catches signals that start with peaks then go flat
+        _tail = _arr[len(_arr) // 3:]
+        _tail_std = float(_tail.std())
+        _tail_amp = float(_tail.max() - _tail.min())
+        # Count peaks across full signal — valid PPG needs at least 5 cardiac cycles
+        _peaks, _ = signal.find_peaks(_arr, distance=36, height=float(_arr.mean()))
+        _is_flat = (_tail_std < 0.01 or _tail_amp < 0.05) or len(_peaks) < 5
+        if _is_flat:
+            sqi_info = {"score": 0.0, "valid": False, "flag": "FLAT_SIGNAL"}
+            return {
+                "status": "poor_signal",
+                "admissionId": adm_id,
+                "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
+                "device_type": "BP_SPO2",
+                "timestamp": int(time.time()),
+                "sqi": sqi_info,
+                "message": "Flat signal detected. No physiological waveform present."
+            }
+
     if len(model_ready_pleth) < 120:
         return {"status": "error", "message": "Signal too short for AI inference."}
 

@@ -118,7 +118,7 @@ def run():
             if _flush_counter >= _FLUSH_EVERY:
                 producer.flush()
                 _flush_counter = 0
-            dev  = result.get("device_type", "-")
+            dev  = result.get("deviceType", "-")
             bp   = result.get("bp", {})
             sbp  = bp.get("bpSystolic",  "-")
             dbp  = bp.get("bpDiastolic", "-")
@@ -133,7 +133,7 @@ def run():
         elif status == "poor_signal":
             sqi  = result.get("sqi", {})
             flag = sqi.get("flag", "-")
-            print(f"[SIG]  POOR_SIGNAL  | adm={adm_id} | dev={result.get('device_type','-')} | flag={flag}")
+            print(f"[SIG]  POOR_SIGNAL  | adm={adm_id} | dev={result.get('deviceType','-')} | flag={flag}")
 
         elif status == "ignored":
             print(f"[IGN]  IGNORED      | adm={adm_id} | {result.get('message','')}")

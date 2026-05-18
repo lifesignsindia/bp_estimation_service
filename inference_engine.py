@@ -249,7 +249,7 @@ class VitalInferenceEngine:
         d2  = np.gradient(d1)
         ttp = t[np.argmax(cyc)]
         tdp = t[-1] - ttp if t[-1] - ttp != 0 else 1e-6
-        auc = float(np.trapz(cyc, t))
+        auc = float(np.trapezoid(cyc, t))
         a_w = float(np.max(d2))
         b_w = float(np.min(d2))
         peak_idx  = np.argmax(cyc)
@@ -399,7 +399,7 @@ class VitalInferenceEngine:
         d1  = np.gradient(cycle)
         d2  = np.gradient(d1)
 
-        auc   = float(np.trapz(cycle, t))
+        auc   = float(np.trapezoid(cycle, t))
         pw    = t[-1]
         ttp   = t[np.argmax(cycle)]
         tdp   = pw - ttp if pw - ttp != 0 else 1e-6

@@ -96,27 +96,22 @@ SESSION_STORAGE = {}
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Smart Device Detection
 # ─────────────────────────────────────────────────────────────────────────────
+_DEVICE_INPUT_MAP = {
+    "NISO101": DEVICE_BERRYMED,
+    "NISO103": DEVICE_CHECKME,
+    "NISO204": DEVICE_NISO204,
+}
+
+_DEVICE_HZ_MAP = {
+    DEVICE_NISO204:  200,
+    DEVICE_CHECKME:  125,
+    DEVICE_BERRYMED: 200,
+}
+
 def _detect_device(json_data):
-    """Safely distinguishes between continuous monitors and spot-check cuffs."""
-    device_block = json_data.get("device", {}) or {}
-    dtype = str(device_block.get("deviceType", "")).upper()
-    dev_name = str(json_data.get("DeviceName", "")).upper()
-
-    # ROUTE A: THE CUFF (Spot-Check Ground Truth)
-    if "LS06" in dtype or "LEPU" in dtype or "bp" in json_data:
+    if "bp" in json_data:
         return DEVICE_LS06
-
-    # ROUTE B: THE CONTINUOUS MONITORS
-    if dev_name == "NISO204" and "Pleth" in json_data:
-        return DEVICE_NISO204
-
-    if "CHECKME" in dtype or "NISO103" in dtype:
-        return DEVICE_CHECKME
-        
-    if "BERRY" in dtype or "NISO101" in dtype:
-        return DEVICE_BERRYMED
-
-    return "UNKNOWN"
+    return _DEVICE_INPUT_MAP.get(json_data.get("deviceName", ""), "UNKNOWN")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. The DSP Janitor (Routing & Strict 120Hz Resampling)
@@ -234,12 +229,18 @@ def process_vitals(json_data):
 
     # --- PATHWAY 1: THE BP CUFF (Update Reference Storage) ---
     if device_type == DEVICE_LS06 or "bp" in json_data:
-        bp_block = json_data.get("bp", {}) or json_data # Handle different structures
-        sys_val = int(bp_block.get("bpSystolic", bp_block.get("BPSystolic", 0)))
-        dia_val = int(bp_block.get("bpDiastolic", bp_block.get("BPDiastolic", 0)))
-        cuff_error = bp_block.get("bpErrorMsg", "")
+        bp_block = json_data.get("bp", {}) or json_data
+        sys_val    = int(bp_block.get("BPSYS",  bp_block.get("bpSystolic",  bp_block.get("BPSystolic",  0))))
+        dia_val    = int(bp_block.get("BPDIA",  bp_block.get("bpDiastolic", bp_block.get("BPDiastolic", 0))))
+        cuff_error = int(bp_block.get("BP_ERROR", 0))
 
-        # Reject hardware error sentinels (e.g., 404/200)
+        if cuff_error != 0:
+            return {
+                "status": "error",
+                "admissionId": adm_id,
+                "message": f"Cuff hardware error (BP_ERROR={cuff_error}). Reading {sys_val}/{dia_val} rejected."
+            }
+
         if sys_val >= 400 or dia_val >= 200:
             return {
                 "status": "error",
@@ -270,7 +271,7 @@ def process_vitals(json_data):
             SESSION_STORAGE[adm_id] = {
                 "start_time": time.time(),
                 "readings": [],
-                "is_first_reading": True,
+                "is_first_reading": {},
                 "needs_recalibration": _needs_recal,
                 "current_interval": 1200 if _needs_recal else 900,
                 "last_confirmation_time": 0,
@@ -280,51 +281,70 @@ def process_vitals(json_data):
                 "aix_history": [],
             }
         else:
-            SESSION_STORAGE[adm_id]["is_first_reading"] = True
+            SESSION_STORAGE[adm_id]["is_first_reading"] = {}
 
         return {
             "status": "success",
-            "device_type": "REFERENCE_UPDATE",
+            "deviceType": "REFERENCE_UPDATE",
             "admissionId": adm_id,
             "bp": {
                 "bpSystolic": sys_val,
                 "bpDiastolic": dia_val,
-                "bpErrorMsg": cuff_error if cuff_error else "None"
+                "BP_ERROR": cuff_error
             },
             "message": f"Reference BP for {adm_id} updated to {sys_val}/{dia_val}. AI will use this for calibration."
         }
 
     # --- PATHWAY 2: CONTINUOUS MONITORS (For AI) ---
-    raw_pleth = []
-    actual_hz = 120 
-    
-    if device_type == DEVICE_NISO204:
-        raw_pleth = json_data.get("Pleth", []) or json_data.get("PlethWave", [])
-        actual_hz = 200  # NISO204 transmits at 200 Hz, resampled to 120 Hz before inference
-        
-    elif device_type in [DEVICE_CHECKME, DEVICE_BERRYMED]:
-        raw_pleth = json_data.get("pleth", {}).get("plethWave", [])
-        actual_hz = 125 if device_type == DEVICE_CHECKME else 200
-    else:
-        return {"status": "error", "admissionId": adm_id, "message": f"Unknown device format for {device_type}."}
+    _meta = {k: json_data[k] for k in [
+        "category", "patientName", "assignedDoctor", "deviceId",
+        "epochTime", "seqNum", "seqPart", "spo2", "device",
+        "cgroup", "pgroup", "facilityId", "patientId",
+    ] if k in json_data}
+
+    if device_type == "UNKNOWN":
+        return {**_meta, "status": "error", "admissionId": adm_id,
+                "message": f"Unknown deviceName: {json_data.get('deviceName')}. Expected NISO101/NISO103/NISO204."}
+
+    actual_hz = _DEVICE_HZ_MAP.get(device_type, 120)
+    raw_pleth = json_data.get("pleth", {}).get("PLETH", [])
 
     # 1. Clean and enforce 120Hz
     model_ready_pleth, sqi_info = _preprocess_signal(raw_pleth, actual_hz, 120, device_type)
 
     if isinstance(sqi_info, dict) and not sqi_info.get("valid", True):
         sqi_flag = sqi_info.get("flag", "INVALID")
-        return {
+        return {**_meta,
             "status": "poor_signal",
             "admissionId": adm_id,
-            "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
-            "device_type": "BP_SPO2",
+            "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+            "deviceType": "BP_SPO2",
             "timestamp": int(time.time()),
             "sqi": sqi_info,
             "message": f"Poor signal quality ({sqi_flag}). Skipping inference."
         }
 
+    if len(model_ready_pleth) > 0:
+        _arr = np.array(model_ready_pleth)
+        _tail = _arr[len(_arr) // 3:]
+        _tail_std = float(_tail.std())
+        _tail_amp = float(_tail.max() - _tail.min())
+        _peaks, _ = signal.find_peaks(_arr, distance=36, height=float(_arr.mean()))
+        _is_flat = (_tail_std < 0.01 or _tail_amp < 0.05) or len(_peaks) < 5
+        if _is_flat:
+            _flat_sqi = {"score": 0.0, "valid": False, "flag": "FLAT_SIGNAL"}
+            return {**_meta,
+                "status": "poor_signal",
+                "admissionId": adm_id,
+                "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+                "deviceType": "BP_SPO2",
+                "timestamp": int(time.time()),
+                "sqi": _flat_sqi,
+                "message": "Flat signal detected. No physiological waveform present."
+            }
+
     if len(model_ready_pleth) < 120:
-        return {"status": "error", "message": "Signal too short for AI inference."}
+        return {**_meta, "status": "error", "admissionId": adm_id, "message": "Signal too short for AI inference."}
 
     pleth_out = [round(float(x), 6) for x in model_ready_pleth]
 
@@ -393,7 +413,7 @@ def process_vitals(json_data):
             SESSION_STORAGE[adm_id] = {
                 "start_time": now,
                 "readings": [],
-                "is_first_reading": True,
+                "is_first_reading": {},
                 "needs_recalibration": _needs_recal,
                 "current_interval": 1200 if _needs_recal else 900,
                 "last_confirmation_time": 0,
@@ -402,25 +422,22 @@ def process_vitals(json_data):
                 "aix_values": [],
                 "aix_history": [],
             }
-        
+
         session = SESSION_STORAGE[adm_id]
 
-        # 6. SMART CALIBRATION: Mismatch Detection
-        # Rule: Alerts are only immediate for the FIRST reading.
-        # Otherwise, they wait for the 15-minute average to confirm stability.
-        # Skip calibration entirely if the AI had no valid signal — fallback values must never trigger alerts.
+        # 6. SMART CALIBRATION: first packet per device → immediate check, rest → 15-min window
         has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0
-        is_immediate  = has_reference and (session["is_first_reading"] or session["needs_recalibration"])
+        is_immediate  = has_reference and session["is_first_reading"].get(device_type, True)
 
         if is_immediate and not bp_valid:
-            return {
+            return {**_meta,
                 "status": "poor_signal",
                 "admissionId": adm_id,
-                "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
-            "device_type": "BP_SPO2",
+                "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+                "deviceType": "BP_SPO2",
                 "timestamp": int(now),
                 "sqi": sqi_info,
-                "message": "Poor signal on first/recalibration packet. Waiting for clean signal before calibration check."
+                "message": "Poor signal on first packet. Waiting for clean signal before calibration check."
             }
 
         if is_immediate:
@@ -433,20 +450,21 @@ def process_vitals(json_data):
             else:
                 sbp_mismatch = (sbp_pred > 140 or sbp_pred < 90)
                 dbp_mismatch = (dbp_pred > 90  or dbp_pred < 60)
-            
+
             if sbp_mismatch or dbp_mismatch:
                 session["needs_recalibration"] = True
+                session["is_first_reading"][device_type] = False
                 _recal_write(adm_id, True)
                 alert_msg = (
                     f"Physiological Alert: AI={sbp_pred}/{dbp_pred} outside normal range."
                     if ref_sbp == 0 and ref_dbp == 0
                     else f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={sbp_pred}/{dbp_pred}."
                 )
-                alert_payload = {
+                alert_payload = {**_meta,
                     "status": "alert",
                     "admissionId": adm_id,
-                    "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
-            "device_type": "BP_SPO2",
+                    "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+                    "deviceType": "BP_SPO2",
                     "timestamp": int(now),
                     "message": alert_msg,
                     "bp": {
@@ -458,7 +476,7 @@ def process_vitals(json_data):
                         "reference_dbp": ref_dbp
                     },
                     "sqi": sqi_info,
-                    "pleth": pleth_out,
+                    "pleth": {"PLETH": pleth_out},
                 }
                 if hb_pred != "N/A":
                     alert_payload["hemoglobin"] = hb_pred
@@ -466,38 +484,41 @@ def process_vitals(json_data):
                     alert_payload["glucose"] = glu_pred
                 return alert_payload
 
-        # 7. OUTPUT LOGIC (Immediate for First, 15-min Average for rest)
+        # First reading matched — subsequent packets from this device go to the window
+        if is_immediate:
+            session["is_first_reading"][device_type] = False
+
+        # 7. OUTPUT LOGIC (15-min window accumulation)
         if bp_valid:
             session["readings"].append((sbp_pred, dbp_pred, hb_pred, glu_pred))
             if pkt_delta_s is not None:
                 session["deltas"].append((pkt_delta_s, pkt_delta_d))
         if aix is not None:
             session["aix_values"].append(aix)
-        
-        # Check if current window interval has elapsed (Standard=900, Recovery=1200)
+
         target_interval = session.get("current_interval", 900)
         elapsed = now - session["start_time"]
-        
+
         if not is_immediate and elapsed < target_interval:
             trending, morphology = _compute_trends(session)
             if not bp_valid:
-                return {
+                return {**_meta,
                     "status": "poor_signal",
                     "admissionId": adm_id,
-                    "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
-            "device_type": "BP_SPO2",
+                    "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+                    "deviceType": "BP_SPO2",
                     "timestamp": int(now),
                     "sqi": sqi_info,
                     "trending": trending,
                     "morphology_change": morphology,
-                    "pleth": pleth_out,
+                    "pleth": {"PLETH": pleth_out},
                     "message": "Poor signal during accumulation window. Waiting for valid packet."
                 }
-            acc = {
+            acc = {**_meta,
                 "status": "accumulating",
                 "admissionId": adm_id,
-                "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
-            "device_type": "BP_SPO2",
+                "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+                "deviceType": "BP_SPO2",
                 "elapsed_seconds": int(elapsed),
                 "target_seconds": int(target_interval),
                 "bp": {
@@ -510,7 +531,7 @@ def process_vitals(json_data):
                 "sqi": sqi_info,
                 "trending": trending,
                 "morphology_change": morphology,
-                "pleth": pleth_out,
+                "pleth": {"PLETH": pleth_out},
                 "message": f"Stability period in progress ({int(elapsed)}/{int(target_interval)}s)."
             }
             if hb_pred != "N/A":
@@ -539,14 +560,14 @@ def process_vitals(json_data):
 
         if not readings:
             session["start_time"] = now
-            return {
+            return {**_meta,
                 "status": "poor_signal",
                 "admissionId": adm_id,
-                "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
-            "device_type": "BP_SPO2",
+                "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+                "deviceType": "BP_SPO2",
                 "timestamp": int(now),
                 "sqi": sqi_info,
-                "pleth": pleth_out,
+                "pleth": {"PLETH": pleth_out},
                 "message": "No valid signal in window. All packets had poor signal quality."
             }
 
@@ -602,15 +623,13 @@ def process_vitals(json_data):
 
         session["start_time"] = now
         session["readings"] = []
-        session["is_first_reading"] = False
-        # deliberately leaving needs_recalibration untouched so the alert state persists
 
         # 8. Construct Final FORMAL JSON
-        final_payload = {
+        final_payload = {**_meta,
             "status": final_status,
             "admissionId": adm_id,
-            "device_name": _DEVICE_NAME_MAP.get(device_type, device_type),
-            "device_type": "BP_SPO2",
+            "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+            "deviceType": "BP_SPO2",
             "timestamp": int(now),
             "reading_count": len(readings),
             "bp": {
@@ -620,19 +639,19 @@ def process_vitals(json_data):
                 "estimated_dbp": avg_dbp,
                 "category": ai_results.get("category", "Unknown"),
                 "trend": ai_results.get("trend", {"trend": "Stable ->", "slope": 0.0, "readings": 0}),
-                "bpErrorMsg": "None"
+                "BP_ERROR": 0
             },
             "sqi": sqi_info,
             "trending": trending,
             "morphology_change": morphology,
-            "pleth": pleth_out,
+            "pleth": {"PLETH": pleth_out},
             "message": final_msg
         }
         if avg_hb != "N/A":
             final_payload["hemoglobin"] = avg_hb
         if avg_glu != "N/A":
             final_payload["glucose"] = avg_glu
-            
+
         return final_payload
     except Exception as e:
         if adm_id in SESSION_STORAGE:

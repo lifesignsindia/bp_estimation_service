@@ -1,99 +1,102 @@
-"""
-kafka_consumer.py - Kafka consumer/producer for the Vitals Inference Pipeline.
-
-Consumes device packets from the input topic, calls process_vitals(),
-and forwards clinical outputs to the output topic.
-
-Forward policy:
-  success / alert      → forwarded to output topic (final 15-min clinical output)
-  accumulating         → stdout only, not forwarded
-  poor_signal / error  → stdout only, not forwarded
-  ignored              → stdout only, not forwarded
-
-Partition key = admissionId — guarantees all packets for a patient land on
-the same partition/consumer instance so SESSION_STORAGE stays consistent.
-
-Pleth array is stripped from the forwarded payload — it is large and only
-needed at the edge for waveform display.
-"""
-
 import json
 import sys
 import time
+import traceback
 import signal as os_signal
-from confluent_kafka import Consumer, Producer, KafkaException
+from confluent_kafka import Consumer, Producer
 from dotenv import load_dotenv
 
 load_dotenv()
 
 import config as cfg
-from vitals_standalone import process_vitals
 
-# ─── Forward statuses (downstream clinical output only) ──────────────────────
+print("[CFG]  ==================== PIPELINE STARTING ====================")
+print("[CFG]  KAFKA_BROKERS      =", cfg.KAFKA_BROKERS)
+print("[CFG]  KAFKA_INPUT_TOPIC  =", cfg.KAFKA_INPUT_TOPIC)
+print("[CFG]  KAFKA_OUTPUT_TOPIC =", cfg.KAFKA_OUTPUT_TOPIC)
+print("[CFG]  KAFKA_GROUP_ID     =", cfg.KAFKA_GROUP_ID)
+print("[CFG]  KAFKA_DEBUG_TOPIC  =", cfg.KAFKA_DEBUG_TOPIC or "(disabled)")
+print("[CFG]  REDIS_HOST         =", cfg.REDIS_HOST)
+print("[CFG]  REDIS_PORT         =", cfg.REDIS_PORT)
+print("[CFG]  ============================================================")
+sys.stdout.flush()
+
+print("[IMPORT] Loading vitals_standalone...")
+sys.stdout.flush()
+try:
+    from vitals_standalone import process_vitals
+    print("[IMPORT] vitals_standalone loaded OK")
+    sys.stdout.flush()
+except Exception as e:
+    print(f"[IMPORT] FATAL: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
 FORWARD_STATUSES = {"success", "alert"}
 
-# ─── Kafka Consumer ───────────────────────────────────────────────────────────
 consumer = Consumer({
-    "bootstrap.servers":  cfg.KAFKA_BROKERS,
-    "group.id":           cfg.KAFKA_GROUP_ID,
-    "auto.offset.reset":  "latest",
-    "enable.auto.commit": True,
-    "session.timeout.ms": 30000,
+    "bootstrap.servers":    cfg.KAFKA_BROKERS,
+    "group.id":             cfg.KAFKA_GROUP_ID,
+    "auto.offset.reset":    "latest",
+    "enable.auto.commit":   True,
+    "session.timeout.ms":   30000,
     "max.poll.interval.ms": 300000,
 })
 
-# ─── Kafka Producer ───────────────────────────────────────────────────────────
 producer = Producer({
-    "bootstrap.servers":        cfg.KAFKA_BROKERS,
-    "linger.ms":                20,
-    "batch.num.messages":       500,
-    "compression.type":         "snappy",
-    "acks":                     "1",
-    "delivery.timeout.ms":      10000,
+    "bootstrap.servers":   cfg.KAFKA_BROKERS,
+    "linger.ms":           20,
+    "batch.num.messages":  500,
+    "compression.type":    "snappy",
+    "acks":                "1",
+    "delivery.timeout.ms": 10000,
 })
 
-_flush_counter = 0
-_FLUSH_EVERY   = 50
+print("[INIT] Consumer and producer created OK")
+sys.stdout.flush()
+
+_flush_counter  = 0
+_FLUSH_EVERY    = 50
+_msg_count      = 0
+_last_heartbeat = time.time()
+_running        = True
 
 
 def _delivery_cb(err, msg):
     if err:
         print(f"[KAFKA] Delivery FAILED | topic={msg.topic()} | err={err}")
+    else:
+        print(f"[KAFKA] Delivery OK | topic={msg.topic()} | partition={msg.partition()} | offset={msg.offset()}")
+    sys.stdout.flush()
 
 
-# ─── Debug Publisher (only active if KAFKA_DEBUG_TOPIC is set) ────────────────
 def _debug(event, detail="", adm_id="-", status="-"):
     if not cfg.KAFKA_DEBUG_TOPIC:
         return
-    msg = json.dumps({
-        "timestamp": int(time.time()),
-        "event":     event,
-        "admissionId": adm_id,
-        "status":    status,
-        "detail":    detail,
-        "input_topic":  cfg.KAFKA_INPUT_TOPIC,
-        "output_topic": cfg.KAFKA_OUTPUT_TOPIC,
-        "group_id":     cfg.KAFKA_GROUP_ID,
-    })
     try:
         producer.produce(
             cfg.KAFKA_DEBUG_TOPIC,
-            key=adm_id.encode("utf-8"),
-            value=msg.encode("utf-8"),
+            key=adm_id.encode(),
+            value=json.dumps({
+                "timestamp":    int(time.time()),
+                "event":        event,
+                "admissionId":  adm_id,
+                "status":       status,
+                "detail":       detail,
+                "input_topic":  cfg.KAFKA_INPUT_TOPIC,
+                "output_topic": cfg.KAFKA_OUTPUT_TOPIC,
+                "group_id":     cfg.KAFKA_GROUP_ID,
+            }).encode(),
         )
         producer.poll(0)
     except Exception as e:
-        print(f"[DBG]  Publish failed: {e}")
-
-
-
-# ─── Graceful shutdown ────────────────────────────────────────────────────────
-_running = True
+        print(f"[DBG] Publish failed: {e}")
 
 
 def _shutdown(signum, frame):
     global _running
-    print("\n[KAFKA] Shutdown signal received. Draining and closing...")
+    print("\n[KAFKA] Shutdown signal received...")
+    sys.stdout.flush()
     _running = False
 
 
@@ -101,89 +104,124 @@ os_signal.signal(os_signal.SIGINT,  _shutdown)
 os_signal.signal(os_signal.SIGTERM, _shutdown)
 
 
-# ─── Main Loop ────────────────────────────────────────────────────────────────
 def run():
-    global _flush_counter
+    global _flush_counter, _msg_count, _last_heartbeat
+
     consumer.subscribe([cfg.KAFKA_INPUT_TOPIC])
     print(f"[KAFKA] Subscribed → '{cfg.KAFKA_INPUT_TOPIC}' | Output → '{cfg.KAFKA_OUTPUT_TOPIC}' | Group → '{cfg.KAFKA_GROUP_ID}'")
-    _debug("PIPELINE_STARTED", f"Subscribed to {cfg.KAFKA_INPUT_TOPIC}, waiting for input")
+    sys.stdout.flush()
+    _debug("PIPELINE_STARTED", f"Subscribed to {cfg.KAFKA_INPUT_TOPIC}")
 
     while _running:
-        msg = consumer.poll(timeout=1.0)
+        now = time.time()
+        if now - _last_heartbeat >= 30:
+            print(f"[HEARTBEAT] alive | processed={_msg_count} | topic='{cfg.KAFKA_INPUT_TOPIC}'")
+            sys.stdout.flush()
+            _last_heartbeat = now
+
+        try:
+            msg = consumer.poll(timeout=1.0)
+        except Exception as e:
+            print(f"[KAFKA] Poll error: {e}")
+            sys.stdout.flush()
+            continue
 
         if msg is None:
             continue
 
         if msg.error():
             print(f"[KAFKA] Consumer error: {msg.error()}")
+            sys.stdout.flush()
             _debug("CONSUMER_ERROR", str(msg.error()))
             continue
 
+        raw   = msg.value()
+        key   = msg.key().decode() if msg.key() else "-"
+        print(f"[MSG] Received | partition={msg.partition()} | offset={msg.offset()} | size={len(raw)}B | key={key}")
+        sys.stdout.flush()
+
         try:
-            payload = json.loads(msg.value().decode("utf-8"))
+            payload = json.loads(raw.decode())
         except Exception as e:
-            print(f"[KAFKA] Decode error: {e}")
+            print(f"[KAFKA] Decode error: {e} | preview={raw[:100]}")
+            sys.stdout.flush()
             _debug("DECODE_ERROR", str(e))
             continue
+
+        adm_id  = payload.get("admissionId", "UNKNOWN")
+        device  = payload.get("deviceName",  "UNKNOWN")
+        pleth_n = len(payload.get("pleth", {}).get("PLETH", []))
+        print(f"[MSG] Parsed | admissionId={adm_id} | device={device} | pleth_samples={pleth_n}")
+        sys.stdout.flush()
 
         try:
             result = process_vitals(payload)
         except Exception as e:
-            print(f"[KAFKA] process_vitals error: {e}")
-            _debug("INFERENCE_ERROR", str(e))
+            print(f"[KAFKA] Inference error: {e}")
+            traceback.print_exc()
+            sys.stdout.flush()
+            _debug("INFERENCE_ERROR", str(e), adm_id)
             continue
 
-        status = result.get("status")
-        adm_id = result.get("admissionId", "UNKNOWN")
+        _msg_count += 1
+        status = result.get("status", "unknown")
+        adm_id = result.get("admissionId", adm_id)
+        print(f"[RESULT] status={status} | admissionId={adm_id} | total={_msg_count}")
+        sys.stdout.flush()
 
         if status in FORWARD_STATUSES:
-            out = result
-            producer.produce(
-                cfg.KAFKA_OUTPUT_TOPIC,
-                key=adm_id.encode("utf-8"),
-                value=json.dumps(out).encode("utf-8"),
-                callback=_delivery_cb,
-            )
-            _flush_counter += 1
-            if _flush_counter >= _FLUSH_EVERY:
-                producer.flush()
-                _flush_counter = 0
-            dev  = result.get("deviceType", "-")
-            bp   = result.get("bp", {})
-            sbp  = bp.get("bpSystolic",  "-")
-            dbp  = bp.get("bpDiastolic", "-")
-            print(f"[OUT]  {status.upper():<8} | adm={adm_id} | dev={dev} | BP={sbp}/{dbp} | {result.get('message','')}")
-            _debug("OUTPUT_FORWARDED", f"dev={dev} BP={sbp}/{dbp}", adm_id, status)
+            try:
+                producer.produce(
+                    cfg.KAFKA_OUTPUT_TOPIC,
+                    key=adm_id.encode(),
+                    value=json.dumps(result).encode(),
+                    callback=_delivery_cb,
+                )
+                _flush_counter += 1
+                if _flush_counter >= _FLUSH_EVERY:
+                    producer.flush()
+                    _flush_counter = 0
+            except Exception as e:
+                print(f"[KAFKA] Produce error: {e}")
+                sys.stdout.flush()
+            bp = result.get("bp", {})
+            print(f"[OUT] {status.upper()} | adm={adm_id} | BP={bp.get('bpSystolic','-')}/{bp.get('bpDiastolic','-')}")
+            sys.stdout.flush()
+            _debug("OUTPUT_FORWARDED", f"BP={bp.get('bpSystolic','-')}/{bp.get('bpDiastolic','-')}", adm_id, status)
 
         elif status == "accumulating":
             bp      = result.get("bp", {})
             elapsed = result.get("elapsed_seconds", "-")
             target  = result.get("target_seconds",  "-")
-            print(f"[ACC]  {elapsed:>4}s/{target}s | adm={adm_id} | BP={bp.get('bpSystolic','-')}/{bp.get('bpDiastolic','-')} | trending={result.get('trending',False)}")
+            print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} | BP={bp.get('bpSystolic','-')}/{bp.get('bpDiastolic','-')}")
+            sys.stdout.flush()
             _debug("ACCUMULATING", f"{elapsed}/{target}s", adm_id, status)
 
         elif status == "poor_signal":
-            sqi  = result.get("sqi", {})
-            flag = sqi.get("flag", "-")
-            print(f"[SIG]  POOR_SIGNAL  | adm={adm_id} | dev={result.get('deviceType','-')} | flag={flag}")
-            _debug("POOR_SIGNAL", f"flag={flag}", adm_id, status)
+            sqi = result.get("sqi", {})
+            print(f"[SIG] POOR_SIGNAL | adm={adm_id} | flag={sqi.get('flag','-')} | sqi={sqi}")
+            sys.stdout.flush()
+            _debug("POOR_SIGNAL", f"flag={sqi.get('flag','-')}", adm_id, status)
 
         elif status == "ignored":
-            print(f"[IGN]  IGNORED      | adm={adm_id} | {result.get('message','')}")
+            print(f"[IGN] IGNORED | adm={adm_id} | {result.get('message','')}")
+            sys.stdout.flush()
             _debug("IGNORED", result.get("message", ""), adm_id, status)
 
         elif status == "error":
-            print(f"[ERR]  ERROR        | adm={adm_id} | {result.get('message','')}")
+            print(f"[ERR] ERROR | adm={adm_id} | {result.get('message','')}")
+            sys.stdout.flush()
             _debug("PIPELINE_ERROR", result.get("message", ""), adm_id, status)
 
         else:
-            print(f"[???]  {status:<12} | adm={adm_id} | {result.get('message','')}")
+            print(f"[???] {status} | adm={adm_id} | {result.get('message','')}")
+            sys.stdout.flush()
             _debug("UNKNOWN_STATUS", result.get("message", ""), adm_id, status)
 
     producer.flush()
     consumer.close()
     print("[KAFKA] Shutdown complete.")
-    _debug("PIPELINE_STOPPED", "Graceful shutdown complete")
+    _debug("PIPELINE_STOPPED", "Graceful shutdown")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # LifeSigns — System Overview
-**Version:** 7.0
-**Date:** 2026-05-14
+**Version:** 8.0
+**Date:** 2026-05-18
 **Audience:** Product, clinical, and non-engineering stakeholders
 **Scope:** What the system does, who the actors are, how data flows
 
@@ -10,7 +10,7 @@
 
 LifeSigns is a continuous, non-invasive vitals monitoring service. Patients wear a PPG wearable device. Approximately every 3 minutes the device captures a window of pulse waveform (pleth) data and sends it to the LifeSigns server via Kafka. The server analyses the signal using an AI model and produces blood pressure (BP), haemoglobin (Hb), and blood glucose estimates. Results accumulate over a 15-minute window and an averaged clinical reading is forwarded downstream.
 
-The system also accepts manual BP cuff readings (LS06/LEPU device) as a reference ground truth. When a cuff reading is received, the AI's immediate output is compared against it. A significant mismatch triggers an alert so clinical staff can investigate.
+The system also accepts manual BP cuff readings as a reference ground truth. When a cuff reading is received, the AI's first output per device is compared against it immediately. A significant mismatch triggers an alert so clinical staff can investigate.
 
 Each patient is completely independent — different patients can wear different device models simultaneously with no cross-patient dependency.
 
@@ -26,21 +26,23 @@ Monitors BP readings and alerts on the dashboard. Takes a manual cuff reading wh
 
 ### Supported Device Models
 
-All devices send their data on one Kafka topic (`vitals.raw`). The cuff device and the wearable devices share the same topic.
+All devices send their data on one Kafka topic (`vitals.raw`).
 
-| Hardware | Detected as | Native sampling rate | Signal field | Built-in BP in payload? |
-|----------|------------|---------------------|-------------|------------------------|
-| NISO204 | NISO204 | 200 Hz (configurable via `FS` field) | `Pleth` or `PlethWave` | No — never in production packets |
-| CHECKME O2 / NISO103 | CHECKME | 125 Hz | `pleth.plethWave` | Ignored — only pleth used |
-| BerryMed Watch / NISO101 | BERRYMED | 200 Hz | `pleth.plethWave` | Ignored — only pleth used |
-| LS06 / LEPU (reference cuff) | LS06 | — (no inference) | N/A | Yes — `bpSystolic`/`bpDiastolic` only field used |
+| Hardware | deviceName field | Native sampling rate | Pleth field | Built-in BP used? |
+|----------|-----------------|---------------------|-------------|-------------------|
+| NISO204 | `"NISO204"` | 200 Hz | `pleth.PLETH` | No |
+| CHECKME O2 / NISO103 | `"NISO103"` | 125 Hz | `pleth.PLETH` | No |
+| BerryMed Watch / NISO101 | `"NISO101"` | 200 Hz | `pleth.PLETH` | No |
+| Reference cuff | _(has `bp` key)_ | — | N/A | Yes — `BPSYS`/`BPDIA`/`BP_ERROR` |
 
-**NISO204, CHECKME, and BERRYMED** — all three run AI inference on the pleth signal to estimate BP, Hb, and glucose.
+**Device detection** is done via the `deviceName` field at the top level of the JSON packet — not nested, not inferred from other fields.
 
-**LS06** — dedicated reference BP cuff. Its `bpSystolic`/`bpDiastolic` is stored in Redis and used to validate AI output. No pleth inference is done from the cuff.
+**NISO204, NISO103, NISO101** — all three run AI inference on the pleth signal to estimate BP, Hb, and glucose.
+
+**Cuff** — reference BP only. Fields `BPSYS`, `BPDIA`, `BP_ERROR` (integer, 0=valid). Stored in Redis and used to validate AI output. No inference done from cuff.
 
 ### The LifeSigns Server
-Consumes all device packets from `vitals.raw`, routes them by device type, runs AI inference on pleth packets, manages calibration validation state, aggregates session readings over 15 minutes, and forwards clinical outputs to `vitals.clinical`.
+Consumes all device packets from `vitals.raw`, routes them by device type, runs AI inference on pleth packets, manages per-device calibration state, aggregates session readings over 15 minutes, and forwards clinical outputs to `vitals.clinical`.
 
 ### Redis
 Stores the latest reference BP reading per patient, keyed by `admissionId`. TTL = 24 hours. The pipeline fails fast on startup if Redis is unreachable.
@@ -53,7 +55,7 @@ Consume from `vitals.clinical`. Receive only `success` and `alert` payloads — 
 ## 3. End-to-End Data Flow
 
 ```
-  Wearable (NISO204 / CHECKME / BERRYMED)  or  Cuff (LS06)
+  Wearable (NISO101 / NISO103 / NISO204)  or  Cuff (bp key present)
            |
            | BLE
            v
@@ -75,52 +77,59 @@ Consume from `vitals.clinical`. Receive only `success` and `alert` payloads — 
   │  │     BLEDeviceID → "UNKNOWN_PATIENT"             │   │
   │  │                                                 │   │
   │  │  2. Device detection                            │   │
-  │  │     LS06 / LEPU / "bp" key → cuff pathway      │   │
-  │  │     DeviceName="NISO204" + "Pleth" → NISO204   │   │
-  │  │     deviceType CHECKME/NISO103 → CHECKME        │   │
-  │  │     deviceType BERRY/NISO101  → BERRYMED        │   │
+  │  │     "bp" key present → cuff pathway             │   │
+  │  │     deviceName="NISO101" → BERRYMED (200Hz)     │   │
+  │  │     deviceName="NISO103" → CHECKME  (125Hz)     │   │
+  │  │     deviceName="NISO204" → NISO204  (200Hz)     │   │
+  │  │     anything else → error (unknown deviceName)  │   │
   │  │                    |                            │   │
   │  │     ┌──── Cuff? ───────────────────────────┐   │   │
-  │  │     │ Extract bpSystolic / bpDiastolic     │   │   │
+  │  │     │ Extract BPSYS / BPDIA                │   │   │
+  │  │     │ Reject if BP_ERROR != 0              │   │   │
   │  │     │ Reject sentinel (sys≥400 or dia≥200) │   │   │
   │  │     │ Check cooldown (15 min since last    │   │   │
   │  │     │   confirmation → ignore if active)   │   │   │
   │  │     │ Write reference to Redis             │   │   │
-  │  │     │ Set is_first_reading=True            │   │   │
+  │  │     │ Reset is_first_reading={}            │   │   │
   │  │     │ Return status=success/REFERENCE_UPDATE│  │   │
   │  │     └──────────────────────────────────────┘   │   │
   │  │                    |  (pleth pathway)           │   │
-  │  │  3. Signal preprocessing (device-specific DSP) │   │
+  │  │  3. Extract _meta fields from input            │   │
+  │  │     (patientId, facilityId, patientName,       │   │
+  │  │      epochTime, seqNum, seqPart, spo2, etc.)   │   │
+  │  │     Passed through to every output payload     │   │
+  │  │                                                │   │
+  │  │  4. Signal preprocessing (device-specific DSP) │   │
   │  │     BERRYMED: bandpass filter → normalize      │   │
-  │  │     CHECKME:  PlethProcessor → SQI from [6]    │   │
-  │  │     NISO204:  median despike → SQI → normalize │   │
-  │  │     All: resample to 120 Hz (model requirement)│   │
-  │  │     Reject if < 120 samples after resample      │   │
-  │  │                    |                            │   │
-  │  │  4. AI Inference                                │   │
-  │  │     VitalInferenceEngine.analyze()              │   │
-  │  │     → SBP, DBP, BP category, Hb, Glucose       │   │
-  │  │     → If AI produces no SBP/DBP: bp_valid=False│   │
-  │  │                    |                            │   │
-  │  │  5. Immediate calibration check                 │   │
-  │  │     Runs when: is_first_reading OR              │   │
-  │  │                needs_recalibration=True         │   │
-  │  │     If bp_valid=False → poor_signal             │   │
-  │  │     If |ref_sbp − pred_sbp| > 15 OR            │   │
-  │  │        |ref_dbp − pred_dbp| > 15:              │   │
-  │  │        → alert, needs_recalibration=True        │   │
-  │  │                    |                            │   │
-  │  │  6. Session accumulation                        │   │
-  │  │     Append (sbp, dbp, hb, glu) if bp_valid      │   │
-  │  │     Wait until 15 min elapsed                   │   │
-  │  │     → accumulating status (not forwarded)       │   │
-  │  │                    |                            │   │
-  │  │  7. Timer expiry → compute averages             │   │
-  │  │     If no readings → poor_signal, reset timer   │   │
-  │  │     Final mismatch check (BOTH SBP and DBP)     │   │
-  │  │     Match: status=success, interval=900         │   │
-  │  │     Mismatch: status=alert,  interval=1200      │   │
-  │  │                                                 │   │
+  │  │     CHECKME:  PlethProcessor → SQI             │   │
+  │  │     NISO204:  median despike → normalize       │   │
+  │  │     All: resample to 120 Hz                    │   │
+  │  │     Flat signal check (tail std / peak count)  │   │
+  │  │     Reject if < 120 samples after resample     │   │
+  │  │                    |                           │   │
+  │  │  5. AI Inference                               │   │
+  │  │     VitalInferenceEngine.analyze()             │   │
+  │  │     → SBP, DBP, BP category, Hb, Glucose      │   │
+  │  │                    |                           │   │
+  │  │  6. Immediate calibration check (per device)  │   │
+  │  │     Runs when: is_first_reading.get(device,   │   │
+  │  │                True) = True AND has_reference  │   │
+  │  │     If |ref_sbp − pred_sbp| ≥ 15 OR           │   │
+  │  │        |ref_dbp − pred_dbp| ≥ 15:             │   │
+  │  │        → alert immediately                     │   │
+  │  │     is_first_reading[device] = False after     │   │
+  │  │                    |                           │   │
+  │  │  7. Session accumulation                       │   │
+  │  │     Append (sbp, dbp, hb, glu) to readings    │   │
+  │  │     Wait until 15 min elapsed                 │   │
+  │  │     → accumulating (not forwarded)             │   │
+  │  │                    |                           │   │
+  │  │  8. Timer expiry → compute averages            │   │
+  │  │     If no readings → poor_signal, reset timer  │   │
+  │  │     Mismatch check (SBP OR DBP ≥ 15 mmHg)     │   │
+  │  │     Match:    status=success, interval=900     │   │
+  │  │     Mismatch: status=alert,   interval=1200    │   │
+  │  │                                                │   │
   │  └─────────────────────────────────────────────────┘   │
   │                                                         │
   │  status=success or alert → produce to vitals.clinical  │
@@ -137,64 +146,60 @@ Consume from `vitals.clinical`. Receive only `success` and `alert` payloads — 
 
 ## 4. Signal Processing — How Device Differences Are Handled
 
-Each device has its own DSP pipeline before the signal reaches the AI model.
+Each device has its own DSP pipeline before the signal reaches the AI model. All devices use `pleth.PLETH` as the input field.
 
 | Step | BERRYMED (NISO101) | CHECKME (NISO103) | NISO204 |
 |------|-------------------|------------------|---------|
-| Filtering | Butterworth bandpass 0.5–8 Hz, order 4 | PlethProcessor (internal DSP, 125 Hz) | Median filter (kernel=5) to remove hardware spikes |
-| SQI computation | Default GOOD (no dedicated SQI) | Quality dict from processor results[6] | Multi-factor: SATURATED / POOR_CONTACT / MOTION_DETECTED / GOOD |
-| Amplitude normalisation | Percentile 2nd–98th, clip to [0,1] | Output already normalised by processor | Percentile 2nd–98th, clip to [0,1] |
-| Resampling to 120 Hz | 200 Hz → 120 Hz via scipy.signal.resample | 125 Hz → 120 Hz | From FS field (default 200 Hz) → 120 Hz |
+| Input field | `pleth.PLETH` | `pleth.PLETH` | `pleth.PLETH` |
+| Native Hz | 200 Hz | 125 Hz | 200 Hz |
+| Filtering | Butterworth bandpass 0.5–8 Hz, order 4 | PlethProcessor (internal DSP) | Median filter (kernel=5) |
+| SQI | Default GOOD | Quality dict from processor | Multi-factor: SATURATED / POOR_CONTACT / MOTION_DETECTED / GOOD |
+| Normalisation | Percentile 2–98, clip [0,1] | Already normalised | Percentile 2–98, clip [0,1] |
+| Resampled to | 120 Hz | 120 Hz | 120 Hz |
 
-**Why 120 Hz?** The BP AI model was trained on 120 Hz data. All devices are resampled to this exact rate so the model sees a uniform input regardless of hardware.
+**Why 120 Hz?** The BP AI model was trained on 120 Hz data. All devices are resampled to this exact rate so the model sees uniform input regardless of hardware.
 
-**Minimum signal length:** 120 samples after resampling (equivalent to 1 second at 120 Hz). Packets shorter than this are rejected with `status=error`.
+**Flat signal detection:** After resampling, the pipeline checks if the signal tail has std < 0.01 or amplitude < 0.05, or fewer than 5 peaks. Flat signals are rejected as `poor_signal` before reaching the AI.
+
+**Minimum signal length:** 120 samples after resampling. Packets shorter than this return `status=error`.
 
 ---
 
 ## 5. Session Aggregation — 15-Minute Averaging
 
-A single 30-second pleth capture has measurement variance. LifeSigns accumulates readings over a 15-minute window and outputs one averaged clinical reading per window.
-
 ```
   Pleth packets arrive every ~3 minutes
 
-  t= 0s   Packet 1 → AI estimate → appended to session
+  t= 0s   Packet 1 → AI estimate → immediate check → appended to session
   t= 3m   Packet 2 → AI estimate → appended to session
   t= 6m   Packet 3 → AI estimate → appended to session
   ...
   t=15m   Timer expires → compute average → output success/alert
-
-  Average: mean of all valid SBP, DBP, Hb, Glucose readings in window
-  Reading count included in payload ("reading_count" field)
 ```
 
-**Standard interval:** 900 seconds (15 minutes) after a successful calibration confirmation.
-
-**Recovery interval:** 1200 seconds (20 minutes) when `needs_recalibration=True` — the system gives extra time to collect more data during a mismatch recovery period.
-
-**Immediate output (bypasses timer):** The very first pleth packet after a cuff reading (`is_first_reading=True`) or during recalibration (`needs_recalibration=True`) produces an output immediately without waiting for the timer. This ensures the calibration check happens right away.
+**Standard interval:** 900 seconds (15 minutes).
+**Recovery interval:** 1200 seconds (20 minutes) when `needs_recalibration=True`.
+**reading_count** field in output shows how many valid readings contributed to the average.
 
 ---
 
 ## 6. Calibration and Mismatch Detection
 
-The system uses the LS06 cuff reading as reference ground truth, stored per patient in Redis. The AI's pleth-based BP estimate is validated against this reference.
-
-**Threshold:** 15 mmHg on SBP or DBP (either one triggers an alert).
-
-**Immediate check (first packet or recalibration):**
-- Runs on the first pleth packet after a cuff reading, or on every packet when `needs_recalibration=True`
-- If `|ref_sbp − ai_sbp| > 15` OR `|ref_dbp − ai_dbp| > 15` → `status=alert`
-- `needs_recalibration=True` is set and the recovery interval (1200s) is used for the next window
+**Per-device first-packet check:**
+- `is_first_reading` is a dict keyed by device type — each device gets its own independent flag
+- First packet per device after reference is set → immediate check
+- NISO101, NISO103, NISO204 each get their own first-packet check independently
+- Threshold: ±15 mmHg on SBP OR DBP → immediate `alert`
 
 **15-minute average check:**
-- Runs at the end of every session window
-- Both SBP AND DBP must mismatch to trigger an alert (stricter than immediate check)
-- If mismatch → `status=alert`, `needs_recalibration=True`, interval extended to 1200s
-- If match → `status=success`, 15-minute cooldown starts during which new cuff readings are ignored
+- End of every session window
+- Threshold: ±15 mmHg on SBP OR DBP
+- Match → `success`, cooldown starts (new cuff readings ignored for 15 min)
+- Mismatch → `alert`, interval extended to 1200s
 
-**No reference:** If no cuff reading has ever been stored in Redis (`ref_sbp=0`), mismatch checks are silently skipped. The AI output is forwarded as `success` without a calibration check.
+**No reference:** If no cuff reading stored (`ref_sbp=0`), mismatch checks skipped. Output forwarded as `success`.
+
+**Worst case alert delay:** 15 minutes (if spike happens at start of window). First-packet check catches initial mismatches immediately.
 
 ---
 
@@ -202,40 +207,64 @@ The system uses the LS06 cuff reading as reference ground truth, stored per pati
 
 | Status | Forwarded to vitals.clinical? | Meaning |
 |--------|------------------------------|---------|
-| `success` | **Yes** | 15-minute averaged clinical reading, calibration confirmed |
-| `alert` | **Yes** | Mismatch detected between reference BP and AI estimate |
-| `accumulating` | No — stdout only | Session in progress, timer not yet elapsed |
-| `poor_signal` | No — stdout only | AI could not produce a valid BP (bad signal quality) |
-| `ignored` | No — stdout only | Cuff reading arrived within the 15-minute cooldown |
-| `error` | No — stdout only | Hardware sentinel, signal too short, or AI inference exception |
+| `success` | **Yes** | 15-min averaged reading, calibration confirmed |
+| `alert` | **Yes** | Mismatch detected between reference and AI estimate |
+| `accumulating` | No | Session in progress, timer not elapsed |
+| `poor_signal` | No | Bad signal quality or flat signal |
+| `ignored` | No | Cuff reading within 15-min cooldown |
+| `error` | No | Hardware sentinel, signal too short, AI exception |
 
 ---
 
-## 8. Reference BP Storage (Redis)
+## 8. Output Payload Fields
 
-The cuff reading for each patient is stored in Redis:
+Every `success` and `alert` payload contains:
+
+**Passthrough from input (_meta):**
+`patientId`, `facilityId`, `patientName`, `assignedDoctor`, `deviceId`, `epochTime`, `seqNum`, `seqPart`, `spo2`, `device`, `cgroup`, `pgroup`
+
+**Computed by pipeline:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | string | `success` or `alert` |
+| `admissionId` | string | Patient session key |
+| `deviceName` | string | `NISO101` / `NISO103` / `NISO204` |
+| `deviceType` | string | `BP_SPO2` |
+| `timestamp` | int | Unix epoch of output |
+| `reading_count` | int | Number of valid readings averaged |
+| `bp.bpSystolic` | int | Averaged SBP estimate (mmHg) |
+| `bp.bpDiastolic` | int | Averaged DBP estimate (mmHg) |
+| `bp.estimated_sbp` | int | Same as bpSystolic |
+| `bp.estimated_dbp` | int | Same as bpDiastolic |
+| `bp.category` | string | `hypo` / `normal` / `hyper` |
+| `bp.trend` | object | Trend direction and slope |
+| `bp.BP_ERROR` | int | Always 0 in output |
+| `sqi` | object | `{score, valid, flag}` |
+| `trending` | bool | True if BP trending significantly |
+| `morphology_change` | string | `stable` / `rising` / `falling` |
+| `hemoglobin` | float | Hb estimate (g/dL) — present if valid |
+| `glucose` | int | Glucose estimate (mg/dL) — present if valid |
+| `pleth.PLETH` | array | Processed 120Hz signal array |
+| `message` | string | Human-readable description |
+
+---
+
+## 9. Reference BP Storage (Redis)
 
 - **Key:** `ref:{admissionId}`
 - **Value:** `{"sbp": 120, "dbp": 80, "timestamp": 1234567890}`
 - **TTL:** 86400 seconds (24 hours)
 
-If Redis is unreachable on startup, the pipeline exits immediately (fail-fast). There is no in-memory fallback — Redis is the single source of truth for reference BP.
-
----
-
-## 9. Hb and Glucose Reporting
-
-Hb (haemoglobin) and glucose are estimated by the AI model from the same PPG signal alongside BP. They are included in `success` and `alert` payloads when the AI produces valid values. If the AI does not return valid Hb or glucose, those fields are omitted from the payload (not null — simply absent).
-
-There is no separate calibration requirement for Hb or glucose.
+Pipeline fails fast on startup if Redis is unreachable.
 
 ---
 
 ## 10. What the System Does NOT Do
 
-- **Does not replace a clinical diagnosis.** Alerts prompt human review, not treatment decisions.
-- **Does not handle Bluetooth directly.** BLE connection and frame parsing is handled by the gateway.
-- **Does not use CHECKME or BERRYMED built-in BP fields.** Only LS06 cuff readings and pleth-based AI estimates are used.
-- **Does not store session state across restarts.** SESSION_STORAGE is in-memory. Redis persists reference BP but not session accumulation. On restart, the current 15-minute window is lost and restarts cleanly.
+- **Does not replace clinical diagnosis.** Alerts prompt human review, not treatment decisions.
+- **Does not handle Bluetooth directly.** BLE connection handled by the gateway.
+- **Does not use NISO101/NISO103/NISO204 built-in BP fields.** Only cuff readings and pleth-based AI estimates are used.
+- **Does not store session state across restarts.** SESSION_STORAGE is in-memory. On restart, current window is lost and restarts cleanly.
 - **Does not mix data across patients.** Each admissionId is processed independently.
-- **Does not suppress repeated alerts.** If the AI continues to mismatch the reference, it keeps firing alerts every cycle until a new cuff reading confirms calibration. This is intentional — it keeps alerting until a nurse responds.
+- **Does not suppress repeated alerts.** Keeps alerting every cycle until a nurse responds with a new cuff reading.

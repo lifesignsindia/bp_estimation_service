@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+import config as cfg
 # ─── Startup config dump ─────────────────────────────────────────────────────
 print("[CFG]  ==================== PIPELINE STARTING ====================")
 print("[CFG]  KAFKA_BROKERS      =", cfg.KAFKA_BROKERS)
@@ -39,7 +41,6 @@ print("[CFG]  REDIS_PORT         =", cfg.REDIS_PORT)
 print("[CFG]  ============================================================")
 sys.stdout.flush()
 
-import config as cfg
 from vitals_standalone import process_vitals
 
 # ─── Forward statuses (downstream clinical output only) ──────────────────────

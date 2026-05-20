@@ -279,9 +279,12 @@ def process_vitals(json_data):
                 "baseline_delta": None,
                 "aix_values": [],
                 "aix_history": [],
+                "last_packet_time": {},
+                "last_drift_alert_time": 0,
             }
         else:
             SESSION_STORAGE[adm_id]["is_first_reading"] = {}
+            SESSION_STORAGE[adm_id]["last_drift_alert_time"] = 0
 
         return {
             "status": "success",
@@ -384,7 +387,7 @@ def process_vitals(json_data):
         # AIx from this packet
         aix = _compute_aix(model_ready_pleth, fs=120)
 
-        # Two-path BP correction
+        # Proposition 2: Reference-anchored per-packet correction
         ref_s = patient_ref.get("sbp", 0)
         ref_d = patient_ref.get("dbp", 0)
         if bp_valid:
@@ -395,11 +398,12 @@ def process_vitals(json_data):
                     ref_cat = "hyper"
                 else:
                     ref_cat = "normal"
-                if model_cat_raw != ref_cat:
-                    m_base_s, m_base_d = cfg.BP_CATEGORY_BASES.get(model_cat_raw, (118.0, 76.0))
-                    r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
-                    sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
-                    dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))
+                m_base_s, m_base_d = cfg.BP_CATEGORY_BASES.get(model_cat_raw, (118.0, 76.0))
+                if model_cat_raw == ref_cat:
+                    # Same category: shift output to patient's personal baseline
+                    sbp_pred = int(round(float(np.clip(sbp_pred + (ref_s - m_base_s), *cfg.BP_SBP_LIMITS))))
+                    dbp_pred = int(round(float(np.clip(dbp_pred + (ref_d - m_base_d), *cfg.BP_DBP_LIMITS))))
+                # Different category: trust model's raw output — reference used for alert only
             else:
                 sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
 
@@ -421,9 +425,20 @@ def process_vitals(json_data):
                 "baseline_delta": None,
                 "aix_values": [],
                 "aix_history": [],
+                "last_packet_time": {},
+                "last_drift_alert_time": 0,
             }
 
         session = SESSION_STORAGE[adm_id]
+
+        # Proposition 1: Gap Detection — re-arm first-reading check if gap ≥ 10 minutes
+        _last_pkt = session.setdefault("last_packet_time", {}).get(device_type, 0)
+        if _last_pkt > 0 and (now - _last_pkt) >= 600:
+            session["is_first_reading"][device_type] = True
+            session["readings"] = []
+            session["last_drift_alert_time"] = 0
+            print(f"[GAP] {adm_id} | {device_type} | gap={int(now - _last_pkt)}s ≥ 600s → re-arming first-reading check")
+        session["last_packet_time"][device_type] = now
 
         # 6. SMART CALIBRATION: first packet per device → immediate check, rest → 15-min window
         has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0
@@ -514,6 +529,43 @@ def process_vitals(json_data):
                     "pleth": {"PLETH": pleth_out},
                     "message": "Poor signal during accumulation window. Waiting for valid packet."
                 }
+            # Proposition 3: Mid-window drift alert
+            # Fires if the average deviation of accumulated corrected readings from
+            # the reference exceeds 15 mmHg SBP or 10 mmHg DBP, with a 5-min cooldown.
+            if ref_s > 0 and ref_d > 0 and len(session["readings"]) >= 3:
+                _last_drift = session.get("last_drift_alert_time", 0)
+                if (now - _last_drift) >= 300:
+                    _avg_sbp_dev = float(np.mean([r[0] - ref_s for r in session["readings"]]))
+                    _avg_dbp_dev = float(np.mean([r[1] - ref_d for r in session["readings"]]))
+                    if abs(_avg_sbp_dev) > 15 or abs(_avg_dbp_dev) > 10:
+                        session["last_drift_alert_time"] = now
+                        _drift_payload = {**_meta,
+                            "status": "alert",
+                            "admissionId": adm_id,
+                            "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+                            "deviceType": "BP_SPO2",
+                            "timestamp": int(now),
+                            "bp": {
+                                "bpSystolic": sbp_pred,
+                                "bpDiastolic": dbp_pred,
+                                "estimated_sbp": sbp_pred,
+                                "estimated_dbp": dbp_pred,
+                                "category": ai_results.get("category", "Unknown"),
+                                "reference_sbp": ref_s,
+                                "reference_dbp": ref_d,
+                            },
+                            "sqi": sqi_info,
+                            "trending": trending,
+                            "morphology_change": morphology,
+                            "pleth": {"PLETH": pleth_out},
+                            "message": f"Mid-window drift alert: avg deviation SBP={_avg_sbp_dev:+.1f} DBP={_avg_dbp_dev:+.1f} from reference {ref_s}/{ref_d}."
+                        }
+                        if hb_pred != "N/A":
+                            _drift_payload["hemoglobin"] = hb_pred
+                        if glu_pred != "N/A":
+                            _drift_payload["glucose"] = glu_pred
+                        return _drift_payload
+
             acc = {**_meta,
                 "status": "accumulating",
                 "admissionId": adm_id,
@@ -623,6 +675,7 @@ def process_vitals(json_data):
 
         session["start_time"] = now
         session["readings"] = []
+        session["last_drift_alert_time"] = 0
 
         # 8. Construct Final FORMAL JSON
         final_payload = {**_meta,

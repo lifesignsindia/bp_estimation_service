@@ -11,6 +11,10 @@ ENV/
 *.log
 *.png
 *.mp4
+*1.json
+send_test.py
+_msg.json
+settings.local.json
 *.pdf
 test_app/static/plots/
 test_app/

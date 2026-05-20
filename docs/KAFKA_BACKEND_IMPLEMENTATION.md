@@ -1,15 +1,13 @@
 # LifeSigns — Kafka & Backend Implementation
-**Version:** 2.0
-**Date:** 2026-05-14
-**Scope:** Kafka topic design, consumer/producer wiring, Docker deployment, and startup instructions
+**Version:** 3.0
+**Date:** 2026-05-18
+**Scope:** Kafka topic design, input/output format, consumer/producer wiring, Docker deployment
 
 ---
 
 ## 1. Overview
 
-The LifeSigns pipeline uses Kafka as its message bus. All BLE devices (NISO204, CHECKME, BERRYMED, LS06) publish their JSON packets to one input topic. The pipeline consumes from that topic, runs `process_vitals()`, and publishes only clinical outputs (`success` and `alert`) to one output topic. All other statuses (`accumulating`, `poor_signal`, `ignored`, `error`) are written to stdout only.
-
-**Partition key = `admissionId` on both topics.** This guarantees all packets for one patient land on the same partition and consumer instance, keeping SESSION_STORAGE consistent in memory.
+The LifeSigns pipeline uses Kafka as its message bus. All BLE devices (NISO101, NISO103, NISO204) and the reference cuff publish JSON packets to one input topic. The pipeline consumes from that topic, runs `process_vitals()`, and publishes only clinical outputs (`success` and `alert`) to one output topic.
 
 ```
   BLE Gateway
@@ -28,33 +26,142 @@ The LifeSigns pipeline uses Kafka as its message bus. All BLE devices (NISO204, 
 ## 2. Topic Design
 
 ### `vitals.raw` — Inbound
-**Direction:** BLE Gateway → pipeline  
-**Partitions:** 10  
-**Retention:** default (7 days)  
-**Partition key:** `admissionId`  
+**Direction:** BLE Gateway → pipeline
+**Partitions:** 10
+**Partition key:** `admissionId`
 
-All device types publish here. The pipeline inspects the payload to determine device type and routing. No separate reference BP topic — the LS06 cuff packet arrives on this same topic and is handled by the cuff pathway inside `process_vitals()`.
+All device types publish here. Device routing is determined by:
+- `bp` key present → cuff pathway
+- `deviceName` field → PPG pathway (`NISO101` / `NISO103` / `NISO204`)
 
 ---
 
 ### `vitals.clinical` — Outbound
-**Direction:** pipeline → downstream consumers  
-**Partitions:** 10  
-**Retention:** default (7 days)  
-**Partition key:** `admissionId`  
+**Direction:** pipeline → downstream consumers
+**Partitions:** 10
+**Partition key:** `admissionId`
 
-Only two statuses are published here:
+Only two statuses published here:
 
 | Status | Meaning |
 |--------|---------|
 | `success` | 15-minute averaged reading, calibration confirmed |
-| `alert` | Immediate mismatch or averaged mismatch vs reference BP |
+| `alert` | Mismatch detected between reference BP and AI estimate |
 
-Everything else — `accumulating`, `poor_signal`, `ignored`, `error` — goes to stdout only. Downstream consumers only see actionable clinical data.
+`accumulating`, `poor_signal`, `ignored`, `error` → stdout only, never forwarded.
 
 ---
 
-## 3. Consumer Configuration
+## 3. Input Packet Format
+
+### PPG Device Packet (NISO101 / NISO103 / NISO204)
+
+```json
+{
+  "admissionId": "ADM454567633",
+  "patientId": "ShivaTestkedke",
+  "patientName": "Shivam Kumar",
+  "assignedDoctor": "Dr. Shivam Kumar",
+  "facilityId": "CF199221737",
+  "deviceId": "BPLKPO",
+  "deviceName": "NISO101",
+  "epochTime": 1779089450,
+  "seqNum": 1,
+  "seqPart": 1,
+  "spo2": 98,
+  "device": "NISO101",
+  "cgroup": "TestingA",
+  "pgroup": "5th Floor",
+  "Age": 29,
+  "Gender": "MALE",
+  "BMI": 24.2,
+  "pleth": {
+    "PLETH": [681473, 681236, 679581, ...]
+  }
+}
+```
+
+**Required fields:** `admissionId`, `deviceName`, `pleth.PLETH`
+**Optional fields:** all others are passthrough `_meta` — included in output if present
+
+**deviceName values:** `"NISO101"` | `"NISO103"` | `"NISO204"` — top level, case sensitive
+**pleth.PLETH:** minimum 120 samples, real device sends ~3600
+
+---
+
+### Cuff Reference Packet
+
+```json
+{
+  "admissionId": "ADM454567633",
+  "bp": {
+    "BPSYS": 120,
+    "BPDIA": 80,
+    "BP_ERROR": 0
+  }
+}
+```
+
+**Required fields:** `admissionId`, `bp.BPSYS`, `bp.BPDIA`, `bp.BP_ERROR`
+**BP_ERROR:** integer — `0` = valid reading, non-zero = hardware error (rejected)
+**Send once per patient session** before PPG packets for calibration to work.
+
+---
+
+## 4. Output Packet Format
+
+Both `success` and `alert` share the same structure.
+
+```json
+{
+  "patientId": "ShivaTestkedke",
+  "facilityId": "CF199221737",
+  "patientName": "Shivam Kumar",
+  "assignedDoctor": "Dr. Shivam Kumar",
+  "deviceId": "BPLKPO",
+  "epochTime": 1779089450,
+  "seqNum": 1,
+  "seqPart": 1,
+  "spo2": 98,
+  "device": "NISO101",
+  "cgroup": "TestingA",
+  "pgroup": "5th Floor",
+  "status": "success",
+  "admissionId": "ADM454567633",
+  "deviceName": "NISO101",
+  "deviceType": "BP_SPO2",
+  "timestamp": 1779090350,
+  "reading_count": 5,
+  "bp": {
+    "bpSystolic": 126,
+    "bpDiastolic": 81,
+    "estimated_sbp": 126,
+    "estimated_dbp": 81,
+    "category": "normal",
+    "trend": { "trend": "Stable ->", "slope": 0.1, "readings": 5 },
+    "BP_ERROR": 0
+  },
+  "sqi": { "score": 0.94, "valid": true, "flag": "GOOD" },
+  "trending": false,
+  "morphology_change": "stable",
+  "hemoglobin": 13.4,
+  "glucose": 97,
+  "pleth": { "PLETH": [0.123456, 0.456789, "..."] },
+  "message": "15-minute averaged clinical payload."
+}
+```
+
+**Alert payload** — same structure, `status: "alert"` and different message:
+```json
+{
+  "status": "alert",
+  "message": "Averaged Calibration Mismatch: Cuff=120/80, AI_Avg=145/98."
+}
+```
+
+---
+
+## 5. Consumer Configuration
 
 ```python
 Consumer({
@@ -62,77 +169,53 @@ Consumer({
     "group.id":           "vitals-pipeline",
     "auto.offset.reset":  "latest",
     "enable.auto.commit": True,
+    "session.timeout.ms": 30000,
+    "max.poll.interval.ms": 300000,
 })
 ```
 
-**Group ID:** `vitals-pipeline` — all pipeline instances share this group; Kafka distributes partitions among them.
-
-**Auto offset reset:** `latest` — on startup, the pipeline picks up from the current tail. Historical packets are not reprocessed. This avoids stale data flooding a fresh deployment.
-
-**Auto commit:** `True` — offsets are committed after each poll cycle. In the rare case of a crash mid-processing, the current packet may be reprocessed once.
+**Group ID:** `vitals-pipeline` — all instances share this group.
+**Auto offset reset:** `latest` — picks up from current tail on startup, no historical reprocessing.
 
 ---
 
-## 4. Producer Configuration
+## 6. Producer Configuration
 
 ```python
 Producer({
-    "bootstrap.servers": KAFKA_BROKERS,
+    "bootstrap.servers":        KAFKA_BROKERS,
+    "linger.ms":                20,
+    "batch.num.messages":       500,
+    "compression.type":         "snappy",
+    "acks":                     "1",
+    "delivery.timeout.ms":      10000,
 })
 ```
 
-`producer.flush()` is called immediately after each message to ensure delivery before moving to the next packet.
-
-Partition key = `admissionId` (UTF-8 encoded). This keeps all packets for one patient on the same partition in both input and output topics.
+Partition key = `admissionId` (UTF-8). Flush every 50 messages.
 
 ---
 
-## 5. Message Flow
-
-```
-  Poll vitals.raw (timeout=1.0s)
-          |
-          | JSON decode
-          v
-  process_vitals(payload)
-          |
-          |─── status in {success, alert}?
-          |         |
-          |         | produce to vitals.clinical
-          |         | key=admissionId
-          |         | flush()
-          |         | log: [KAFKA] Forwarded | adm=... | status=...
-          |
-          |─── status NOT in {success, alert}?
-                    |
-                    | log: [KAFKA] Suppressed | status=... | msg=...
-                    | (stdout only, nothing sent downstream)
-```
-
----
-
-## 6. Environment Variables
-
-All configuration is read from environment variables (with defaults for local development):
+## 7. Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KAFKA_BROKERS` | `localhost:9092` | Kafka bootstrap server address |
+| `KAFKA_BROKERS` | `localhost:9092` | Kafka bootstrap server |
 | `KAFKA_INPUT_TOPIC` | `vitals.raw` | Topic to consume from |
 | `KAFKA_OUTPUT_TOPIC` | `vitals.clinical` | Topic to produce to |
+| `KAFKA_GROUP_ID` | `vitals-pipeline` | Consumer group ID |
 | `REDIS_HOST` | `localhost` | Redis hostname |
 | `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_PASSWORD` | _(none)_ | Redis password (optional) |
 
-In Docker, these are injected via the `environment` block in `docker-compose.yml`.
+In Docker: injected via `environment` block in `docker-compose.yml`.
+Inside Docker network: `KAFKA_BROKERS=kafka:29092`, `REDIS_HOST=redis`.
 
 ---
 
-## 7. Docker Deployment
+## 8. Docker Deployment
 
-The full stack runs in Docker Compose with four services: Zookeeper, Kafka, Redis, and the pipeline container.
-
-### docker-compose.yml summary
+### Services
 
 | Service | Image | Role |
 |---------|-------|------|
@@ -140,104 +223,79 @@ The full stack runs in Docker Compose with four services: Zookeeper, Kafka, Redi
 | `kafka` | confluentinc/cp-kafka:7.5.0 | Message broker |
 | `kafka-init` | confluentinc/cp-kafka:7.5.0 | One-shot topic creation on startup |
 | `redis` | redis:7-alpine | Reference BP persistence |
-| `pipeline` | (built from Dockerfile) | Kafka consumer + inference engine |
+| `pipeline` | built from Dockerfile (python:3.12-slim) | Kafka consumer + AI inference engine |
 
 ### Startup order
 
 ```
-  zookeeper starts
-       |  (healthcheck: nc -z localhost 2181)
-       v
-  kafka starts
-       |  (healthcheck: kafka-broker-api-versions --bootstrap-server localhost:9092)
-       v
-  kafka-init runs  →  creates vitals.raw and vitals.clinical (10 partitions each)
-  redis starts     →  (healthcheck: redis-cli ping)
-       |
-       v
-  pipeline starts  →  loads AI models, pings Redis, subscribes to vitals.raw
+  zookeeper → kafka → kafka-init (creates topics) → redis → pipeline
 ```
 
-The `pipeline` service declares `depends_on` for both `kafka` (service_healthy) and `redis` (service_healthy). It will not start until both pass their healthchecks. `restart: on-failure` handles transient startup failures.
+Pipeline waits for both kafka and redis healthchecks before starting. `restart: on-failure` handles transient startup failures.
 
----
+### Commands
 
-## 8. Running the Stack
+```powershell
+# Start full stack
+docker compose up -d
 
-### First time
-
-```bash
-# Start everything
-docker compose up --build -d
+# First time or after code changes
+docker compose build --no-cache
+docker compose up -d
 
 # Watch pipeline logs
 docker compose logs -f pipeline
-```
 
-### Stopping
-
-```bash
+# Stop
 docker compose down
-```
 
-### Checking Kafka topics
-
-```bash
-docker compose exec kafka kafka-topics --list --bootstrap-server localhost:9092
-```
-
-### Sending a test packet (from host)
-
-```bash
-# Produce a test message to vitals.raw
-docker compose exec kafka kafka-console-producer \
-  --broker-list localhost:9092 \
-  --topic vitals.raw \
-  --property "parse.key=true" \
-  --property "key.separator=:"
-# Type: ADM001:{"admissionId":"ADM001","DeviceName":"NISO204","Pleth":[...]}
-```
-
-### Consuming from vitals.clinical
-
-```bash
-docker compose exec kafka kafka-console-consumer \
-  --bootstrap-server localhost:9092 \
-  --topic vitals.clinical \
-  --from-beginning
+# Clean corrupted Docker cache
+docker builder prune -f
+docker system prune -f
 ```
 
 ---
 
-## 9. Graceful Shutdown
+## 9. Testing Kafka End-to-End
 
-The pipeline handles `SIGINT` and `SIGTERM`:
-
-```
-Signal received
-       |
-  _running = False
-       |
-  Poll loop exits cleanly
-       |
-  consumer.close()
-       |
-  [KAFKA] Consumer closed.
+**Terminal 1 — Watch pipeline:**
+```powershell
+docker compose logs -f pipeline
 ```
 
-Docker Compose sends `SIGTERM` on `docker compose down`. The pipeline drains its current poll cycle and exits within 1–2 seconds.
+**Terminal 2 — Watch output:**
+```powershell
+docker exec -it new_esti-kafka-1 kafka-console-consumer --bootstrap-server localhost:9092 --topic vitals.clinical --from-beginning
+```
+
+**Terminal 3 — Send reference:**
+```powershell
+echo '{"admissionId":"ADM001","bp":{"BPSYS":120,"BPDIA":80,"BP_ERROR":0}}' | docker exec -i new_esti-kafka-1 kafka-console-producer --bootstrap-server localhost:9092 --topic vitals.raw
+```
+
+**Terminal 3 — Send PPG packet (compact to single line):**
+```powershell
+python3 -c "import json; f=open('sample_payloads/101.json'); print(json.dumps(json.load(f)))" | docker exec -i new_esti-kafka-1 kafka-console-producer --bootstrap-server localhost:9092 --topic vitals.raw
+```
+
+**What to expect:**
+- Terminal 1: `[RT_LOG] Admission: ADM001 | AI Estimate: .../...`
+- Terminal 1: `[OUT] ALERT` or `[ACC]`
+- Terminal 2: Full output JSON if `success` or `alert`
+
+**Note:** JSON must be sent as a single line — kafka-console-producer treats each line as a separate message.
 
 ---
 
-## 10. Scaling
+## 10. Graceful Shutdown
 
-**Single instance (current design):**
-All 10 partitions are consumed by one pipeline instance. This supports up to ~50 simultaneous patients on a single server.
+Pipeline handles `SIGINT` and `SIGTERM`:
 
-**Multi-instance:**
-Add more `pipeline` containers sharing the same `group.id`. Kafka distributes partitions automatically. Because SESSION_STORAGE is in-memory, each instance must consistently own the same partitions (which Kafka guarantees by partition assignment). Reference BP in Redis is accessible by any instance.
+```
+Signal received → _running = False → poll loop exits → producer.flush() → consumer.close()
+```
 
-**Do not exceed one pipeline instance per partition.** Extra instances in the same group will be idle (Kafka assigns at most one consumer per partition per group).
+Docker sends `SIGTERM` on `docker compose down`. Pipeline drains current cycle and exits cleanly.
 
 ---
 
@@ -245,9 +303,21 @@ Add more `pipeline` containers sharing the same `group.id`. Kafka distributes pa
 
 | Scenario | Behaviour |
 |----------|-----------|
-| Kafka broker unreachable on startup | confluent-kafka retries connection; pipeline retries until Kafka healthcheck passes |
-| JSON decode failure | Log `[KAFKA] Failed to decode message`, skip packet, continue |
-| `process_vitals()` raises exception | Log `[KAFKA] process_vitals exception`, skip packet, continue |
-| Redis unreachable on startup | `_redis.ping()` raises — pipeline exits immediately (fail-fast) |
-| Redis unreachable during operation | `_ref_read` / `_ref_write` will raise; caught by the outer `except` block in `process_vitals`, returns `status=error` |
-| Pipeline crash mid-packet | Auto-commit means offset may already be committed; packet is not reprocessed |
+| JSON decode failure | Log `[KAFKA] Decode error`, skip packet, continue |
+| `process_vitals()` exception | Log `[KAFKA] process_vitals error`, skip packet, continue |
+| Redis unreachable on startup | `_redis.ping()` raises — pipeline exits immediately |
+| Redis unreachable during operation | `_ref_read`/`_ref_write` raises → caught → `status=error` returned |
+| Unknown deviceName | `status=error`, message lists valid device names |
+| Signal too short | `status=error`, not forwarded |
+| Flat signal | `status=poor_signal`, not forwarded |
+| numpy/model version mismatch | Hb/Glucose return N/A, BP still works |
+
+---
+
+## 12. Scaling
+
+**Single instance:** All 10 partitions consumed by one pipeline. Supports ~50 simultaneous patients.
+
+**Multi-instance:** Add more `pipeline` containers sharing `group.id=vitals-pipeline`. Kafka distributes partitions automatically. SESSION_STORAGE is in-memory per instance — Kafka partition assignment guarantees consistency. Redis reference BP is shared across all instances.
+
+Do not exceed one pipeline instance per partition.

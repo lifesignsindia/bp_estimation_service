@@ -71,7 +71,6 @@ try:
     _redis = redis_lib.Redis(
         host=cfg.REDIS_HOST,
         port=cfg.REDIS_PORT,
-        password=cfg.REDIS_PASSWORD,
         decode_responses=True,
         socket_connect_timeout=5,
         socket_timeout=5,

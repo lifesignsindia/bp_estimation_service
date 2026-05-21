@@ -171,10 +171,11 @@ def run():
 
         if status in FORWARD_STATUSES:
             try:
+                out = {**result, "pleth": payload.get("pleth", {})}
                 producer.produce(
                     cfg.KAFKA_OUTPUT_TOPIC,
                     key=adm_id.encode(),
-                    value=json.dumps(result).encode(),
+                    value=json.dumps(out).encode(),
                     callback=_delivery_cb,
                 )
                 _flush_counter += 1

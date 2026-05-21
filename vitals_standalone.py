@@ -29,18 +29,28 @@ except ImportError as e:
     print("Ensure your 'processors' folder has an __init__.py and the AI files are present.")
     sys.exit(1)
 
-# Initialize the AI Engine globally so it only loads into memory ONCE
-print("Loading AI Models into memory...")
-ai_engine = VitalInferenceEngine()
-print("AI Engine Ready.")
+# ─── AI Engine ───────────────────────────────────────────────────────────────
+print("[AI]   Loading models into memory...")
+sys.stdout.flush()
+try:
+    ai_engine = VitalInferenceEngine()
+    print("[AI]   AI Engine Ready.")
+    sys.stdout.flush()
+except Exception as e:
+    print(f"[AI]   FATAL: AI Engine failed to load — {e}")
+    sys.stdout.flush()
+    sys.exit(1)
 
-# Initialize Processors globally to maintain filter state (zi) across data packets
-# This eliminates "startup transients" or "spikes" at the beginning of each 30s block.
+# ─── Processors ──────────────────────────────────────────────────────────────
+print("[AI]   Initializing device processors...")
+sys.stdout.flush()
 PROCESSORS = {
     "BERRYMED": BerryMedProcessor(fs=200, lowcut=0.5, highcut=8.0, order=4),
     "CHECKME":  CheckmeProcessor(fs=125),
     "NISO204":  NISO204Processor(kernel_size=5)
 }
+print("[AI]   Processors ready.")
+sys.stdout.flush()
 
 # Constants
 DEVICE_NISO204  = "NISO204"
@@ -52,17 +62,28 @@ _DEVICE_NAME_MAP = {
     "BERRYMED": "NISO101",
     "CHECKME":  "NISO103",
     "NISO204":  "NISO204",
-}      
+}
 
-# ─── Redis — Reference BP store (keyed by admissionId) ──────────────────────
-_redis = redis_lib.Redis(
-    host=cfg.REDIS_HOST,
-    port=cfg.REDIS_PORT,
-    password=cfg.REDIS_PASSWORD,
-    decode_responses=True,
-    socket_connect_timeout=5
-)
-_redis.ping()  # fail fast on startup if Redis is unreachable
+# ─── Redis ────────────────────────────────────────────────────────────────────
+print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}...")
+sys.stdout.flush()
+try:
+    _redis = redis_lib.Redis(
+        host=cfg.REDIS_HOST,
+        port=cfg.REDIS_PORT,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+        ssl=True,
+        ssl_cert_reqs=None,   # Skip cert verification for internal AWS endpoint
+    )
+    _redis.ping()
+    print("[REDIS] Connected OK.")
+    sys.stdout.flush()
+except Exception as e:
+    print(f"[REDIS] FATAL: Cannot connect — {e}")
+    sys.stdout.flush()
+    sys.exit(1)
 
 def _ref_write(adm_id, sbp, dbp, timestamp):
     _redis.setex(

@@ -307,14 +307,8 @@ def process_vitals(json_data):
             SESSION_STORAGE[adm_id]["is_first_reading"] = {}
 
         return {
-            "status": "success",
-            "deviceType": "REFERENCE_UPDATE",
+            "status": "ignored",
             "admissionId": adm_id,
-            "bp": {
-                "bpSystolic": sys_val,
-                "bpDiastolic": dia_val,
-                "BP_ERROR": cuff_error
-            },
             "message": f"Reference BP for {adm_id} updated to {sys_val}/{dia_val}. AI will use this for calibration."
         }
 
@@ -424,7 +418,6 @@ def process_vitals(json_data):
                 else:
                     ref_cat = "normal"
                 if model_cat_raw != ref_cat:
-                    m_base_s, m_base_d = cfg.BP_CATEGORY_BASES.get(model_cat_raw, (118.0, 76.0))
                     r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
                     sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
                     dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))

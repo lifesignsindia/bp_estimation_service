@@ -354,6 +354,8 @@ def process_vitals(json_data):
         _tail_amp = float(_tail.max() - _tail.min())
         _peaks, _ = signal.find_peaks(_arr, distance=36, height=float(_arr.mean()))
         _is_flat = (_tail_std < 0.01 or _tail_amp < 0.05) or len(_peaks) < 5
+        print(f"[SQI]  adm={adm_id} | device={device_type} | samples={len(_arr)} | std={_tail_std:.4f} | amp={_tail_amp:.4f} | peaks={len(_peaks)} | flat={_is_flat}")
+        sys.stdout.flush()
         if _is_flat:
             _flat_sqi = {"score": 0.0, "valid": False, "flag": "FLAT_SIGNAL"}
             return {**_meta,

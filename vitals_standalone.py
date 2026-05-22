@@ -284,6 +284,8 @@ def process_vitals(json_data):
 
         # Store this as the ground truth for this patient
         _ref_write(adm_id, sys_val, dia_val, json_data.get("epochTime", 0))
+        print(f"[REF]  Reference BP received | admissionId={adm_id} | SBP={sys_val} DBP={dia_val}")
+        sys.stdout.flush()
         
         # Every time a new reference comes, we want to trigger an immediate 
         # AI confirmation on the next pleth packet, bypassing the 15-min timer.
@@ -378,6 +380,9 @@ def process_vitals(json_data):
     try:
         # Retrieve the latest reference BP for this patient from Redis
         patient_ref = _ref_read(adm_id)
+        if patient_ref.get("sbp", 0) > 0:
+            print(f"[REF]  Using reference | admissionId={adm_id} | SBP={patient_ref['sbp']} DBP={patient_ref['dbp']}")
+            sys.stdout.flush()
 
         ai_results = ai_engine.analyze(
             pleth_array=model_ready_pleth,

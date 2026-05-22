@@ -1,7 +1,7 @@
 {
   "status": "alert",
   "admissionId": "ADM001",
-  "device_name": "NISO101",
+  "deviceName": "NISO101",
   "device_type": "BP_SPO2",
   "timestamp": 1748123456,
   "reading_count": 26,

@@ -14,6 +14,8 @@ ENV/
 *1.json
 send_test.py
 _msg.json
+validation/
+*.pem
 settings.local.json
 *.pdf
 test_app/static/plots/

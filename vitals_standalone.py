@@ -103,16 +103,21 @@ def _recal_read(adm_id):
     raw = _redis.get(f"recal:{adm_id}")
     return raw == "1" if raw else False
 
-# Session Storage to accumulate readings for 15-minute averaging
-# Structure: { admissionId: {
-#    "start_time": timestamp,
-#    "readings": [],
-#    "is_first_reading": True,
-#    "needs_recalibration": False,
-#    "current_interval": 900,
-#    "last_confirmation_time": 0
-# } }
-SESSION_STORAGE = {}
+# ─── Session helpers (Redis-backed, survives restarts & works across pods) ────
+SESSION_TTL = 7200  # 2 hours — longer than any possible 15-min session
+
+def _session_read(adm_id):
+    """Read session from Redis. Returns None if no session exists."""
+    raw = _redis.get(f"session:{adm_id}")
+    return json.loads(raw) if raw else None
+
+def _session_write(adm_id, session):
+    """Write session to Redis with TTL."""
+    _redis.setex(f"session:{adm_id}", SESSION_TTL, json.dumps(session))
+
+def _session_delete(adm_id):
+    """Remove session from Redis (e.g. on hard reset)."""
+    _redis.delete(f"session:{adm_id}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Smart Device Detection
@@ -272,8 +277,8 @@ def process_vitals(json_data):
         # --- CASE 2: REFERENCE COOLDOWN (Error Protection) ---
         # If we successfully confirmed a calibration recently, ignore random/mistaken cuff readings
         now = time.time()
-        if adm_id in SESSION_STORAGE:
-            session = SESSION_STORAGE[adm_id]
+        session = _session_read(adm_id)
+        if session:
             last_confirm = session.get("last_confirmation_time", 0)
             if (now - last_confirm) < 900:
                 return {
@@ -282,16 +287,24 @@ def process_vitals(json_data):
                     "message": f"Reference ignored. System is in 15-minute stability cooldown ({(now - last_confirm)/60:.1f}m elapsed)."
                 }
 
+        # Read OLD reference before overwriting — needed to detect if value changed
+        prev_ref = _ref_read(adm_id)
+
         # Store this as the ground truth for this patient
         _ref_write(adm_id, sys_val, dia_val, json_data.get("epochTime", 0))
         print(f"[REF]  Reference BP received | admissionId={adm_id} | SBP={sys_val} DBP={dia_val}")
         sys.stdout.flush()
-        
-        # Every time a new reference comes, we want to trigger an immediate 
-        # AI confirmation on the next pleth packet, bypassing the 15-min timer.
-        if adm_id not in SESSION_STORAGE:
+
+        # Trigger an immediate AI confirmation on the next pleth packet ONLY if
+        # the reference values actually changed (new cuff reading from staff).
+        # Do NOT reset if the same value comes in repeatedly — that causes an
+        # infinite loop of immediate checks and repeated ALERT outputs.
+        ref_changed = (abs(prev_ref.get("sbp", 0) - sys_val) >= 5 or
+                       abs(prev_ref.get("dbp", 0) - dia_val) >= 5)
+
+        if session is None:
             _needs_recal = _recal_read(adm_id)
-            SESSION_STORAGE[adm_id] = {
+            session = {
                 "start_time": time.time(),
                 "readings": [],
                 "is_first_reading": {},
@@ -303,8 +316,14 @@ def process_vitals(json_data):
                 "aix_values": [],
                 "aix_history": [],
             }
-        else:
-            SESSION_STORAGE[adm_id]["is_first_reading"] = {}
+        elif ref_changed:
+            # New cuff reading from staff → trigger immediate re-check
+            print(f"[REF]  Reference changed {prev_ref.get('sbp')}/{prev_ref.get('dbp')} -> {sys_val}/{dia_val} | triggering re-check")
+            sys.stdout.flush()
+            session["is_first_reading"] = {}
+        # else: same reference repeated — keep session state, no re-check needed
+
+        _session_write(adm_id, session)
 
         return {
             "status": "ignored",
@@ -433,10 +452,11 @@ def process_vitals(json_data):
 
         # 5. INITIALIZE SESSION STATE
         now = time.time()
-        
-        if adm_id not in SESSION_STORAGE:
+
+        session = _session_read(adm_id)
+        if session is None:
             _needs_recal = _recal_read(adm_id)
-            SESSION_STORAGE[adm_id] = {
+            session = {
                 "start_time": now,
                 "readings": [],
                 "is_first_reading": {},
@@ -449,13 +469,12 @@ def process_vitals(json_data):
                 "aix_history": [],
             }
 
-        session = SESSION_STORAGE[adm_id]
-
         # 6. SMART CALIBRATION: first packet per device → immediate check, rest → 15-min window
         has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0
         is_immediate  = has_reference and session["is_first_reading"].get(device_type, True)
 
         if is_immediate and not bp_valid:
+            _session_write(adm_id, session)
             return {**_meta,
                 "status": "poor_signal",
                 "admissionId": adm_id,
@@ -508,6 +527,7 @@ def process_vitals(json_data):
                     alert_payload["hemoglobin"] = hb_pred
                 if glu_pred != "N/A":
                     alert_payload["glucose"] = glu_pred
+                _session_write(adm_id, session)
                 return alert_payload
 
         # First reading matched — subsequent packets from this device go to the window
@@ -528,6 +548,7 @@ def process_vitals(json_data):
         if not is_immediate and elapsed < target_interval:
             trending, morphology = _compute_trends(session)
             if not bp_valid:
+                _session_write(adm_id, session)
                 return {**_meta,
                     "status": "poor_signal",
                     "admissionId": adm_id,
@@ -564,6 +585,7 @@ def process_vitals(json_data):
                 acc["hemoglobin"] = hb_pred
             if glu_pred != "N/A":
                 acc["glucose"] = glu_pred
+            _session_write(adm_id, session)
             return acc
 
         # Timer Expired -> Finalise window trends, then calculate averages
@@ -586,6 +608,7 @@ def process_vitals(json_data):
 
         if not readings:
             session["start_time"] = now
+            _session_write(adm_id, session)
             return {**_meta,
                 "status": "poor_signal",
                 "admissionId": adm_id,
@@ -678,11 +701,14 @@ def process_vitals(json_data):
         if avg_glu != "N/A":
             final_payload["glucose"] = avg_glu
 
+        _session_write(adm_id, session)
         return final_payload
     except Exception as e:
-        if adm_id in SESSION_STORAGE:
-            SESSION_STORAGE[adm_id]["readings"] = []
-            SESSION_STORAGE[adm_id]["start_time"] = time.time()
+        _err_session = _session_read(adm_id)
+        if _err_session is not None:
+            _err_session["readings"] = []
+            _err_session["start_time"] = time.time()
+            _session_write(adm_id, _err_session)
         return {"status": "error", "admissionId": adm_id, "message": f"AI Inference Failed: {str(e)}"}
 
 # ─────────────────────────────────────────────────────────────────────────────

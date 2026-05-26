@@ -392,6 +392,11 @@ def process_vitals(json_data):
 
         # 4. CONSOLE LOGGING (STDOUT) - Always visible, not the formal payload
         bp_valid = "sbp" in ai_results
+        if not bp_valid:
+            n_samples = len(model_ready_pleth)
+            reason = "short_packet" if n_samples < 1800 else "insufficient_segments"
+            print(f"[INF]  adm={adm_id} | device={device_type} | samples={n_samples} | inference_failed={reason}")
+            sys.stdout.flush()
         sbp_pred = int(round(float(ai_results.get("sbp", 120)))) if bp_valid else 120
         dbp_pred = int(round(float(ai_results.get("dbp", 80)))) if bp_valid else 80
         hb_pred  = ai_results.get("hb", "N/A") if bp_valid else "N/A"

@@ -135,9 +135,15 @@ _DEVICE_HZ_MAP = {
 }
 
 def _detect_device(json_data):
+    # Check deviceName first — NISO101/103/204 are PPG devices, never cuff.
+    # If deviceName is known, route directly regardless of any bp field in payload.
+    device_name = json_data.get("deviceName", "")
+    if device_name in _DEVICE_INPUT_MAP:
+        return _DEVICE_INPUT_MAP[device_name]
+    # No recognised deviceName — fall back to bp field presence (LS06 cuff)
     if "bp" in json_data:
         return DEVICE_LS06
-    return _DEVICE_INPUT_MAP.get(json_data.get("deviceName", ""), "UNKNOWN")
+    return "UNKNOWN"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. The DSP Janitor (Routing & Strict 120Hz Resampling)

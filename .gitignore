@@ -21,3 +21,6 @@ settings.local.json
 test_app/static/plots/
 test_app/
 dev.estimated_bp_unfiltered_data.json
+test_local.py
+\
+

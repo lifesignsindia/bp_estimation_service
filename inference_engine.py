@@ -71,9 +71,7 @@ class BPTrendTracker:
         trend = "Rising ^" if slope > 1.0 else ("Falling v" if slope < -1.0 else "Stable ->")
         cats  = [c for c in self._cat_history[-self._window:] if c]
         cat   = Counter(cats).most_common(1)[0][0] if cats else "Normal"
-        return {"trend": trend, "slope": round(slope, 2),
-                "latest_sbp": self._sbp_history[-1],
-                "current_category": cat, "readings": n}
+        return {"trend": trend, "slope": round(slope, 2), "readings": n}
 
 
 # ── Main Engine ───────────────────────────────────────────────────────────────

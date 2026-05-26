@@ -47,7 +47,7 @@ producer = Producer({
     "bootstrap.servers":   cfg.KAFKA_BROKERS,
     "linger.ms":           20,
     "batch.num.messages":  500,
-    "compression.type":    "snappy",
+    "compression.type":    "lz4",
     "acks":                "1",
     "delivery.timeout.ms": 10000,
 })

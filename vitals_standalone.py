@@ -103,16 +103,21 @@ def _recal_read(adm_id):
     raw = _redis.get(f"recal:{adm_id}")
     return raw == "1" if raw else False
 
-# Session Storage to accumulate readings for 15-minute averaging
-# Structure: { admissionId: {
-#    "start_time": timestamp,
-#    "readings": [],
-#    "is_first_reading": True,
-#    "needs_recalibration": False,
-#    "current_interval": 900,
-#    "last_confirmation_time": 0
-# } }
-SESSION_STORAGE = {}
+# ─── Session helpers (Redis-backed, survives restarts & works across pods) ────
+SESSION_TTL = 7200  # 2 hours — longer than any possible 15-min session
+
+def _session_read(adm_id):
+    """Read session from Redis. Returns None if no session exists."""
+    raw = _redis.get(f"session:{adm_id}")
+    return json.loads(raw) if raw else None
+
+def _session_write(adm_id, session):
+    """Write session to Redis with TTL."""
+    _redis.setex(f"session:{adm_id}", SESSION_TTL, json.dumps(session))
+
+def _session_delete(adm_id):
+    """Remove session from Redis (e.g. on hard reset)."""
+    _redis.delete(f"session:{adm_id}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Smart Device Detection
@@ -130,9 +135,15 @@ _DEVICE_HZ_MAP = {
 }
 
 def _detect_device(json_data):
+    # Check deviceName first — NISO101/103/204 are PPG devices, never cuff.
+    # If deviceName is known, route directly regardless of any bp field in payload.
+    device_name = json_data.get("deviceName", "")
+    if device_name in _DEVICE_INPUT_MAP:
+        return _DEVICE_INPUT_MAP[device_name]
+    # No recognised deviceName — fall back to bp field presence (LS06 cuff)
     if "bp" in json_data:
         return DEVICE_LS06
-    return _DEVICE_INPUT_MAP.get(json_data.get("deviceName", ""), "UNKNOWN")
+    return "UNKNOWN"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. The DSP Janitor (Routing & Strict 120Hz Resampling)
@@ -272,8 +283,8 @@ def process_vitals(json_data):
         # --- CASE 2: REFERENCE COOLDOWN (Error Protection) ---
         # If we successfully confirmed a calibration recently, ignore random/mistaken cuff readings
         now = time.time()
-        if adm_id in SESSION_STORAGE:
-            session = SESSION_STORAGE[adm_id]
+        session = _session_read(adm_id)
+        if session:
             last_confirm = session.get("last_confirmation_time", 0)
             if (now - last_confirm) < 900:
                 return {
@@ -282,14 +293,24 @@ def process_vitals(json_data):
                     "message": f"Reference ignored. System is in 15-minute stability cooldown ({(now - last_confirm)/60:.1f}m elapsed)."
                 }
 
+        # Read OLD reference before overwriting — needed to detect if value changed
+        prev_ref = _ref_read(adm_id)
+
         # Store this as the ground truth for this patient
         _ref_write(adm_id, sys_val, dia_val, json_data.get("epochTime", 0))
-        
-        # Every time a new reference comes, we want to trigger an immediate 
-        # AI confirmation on the next pleth packet, bypassing the 15-min timer.
-        if adm_id not in SESSION_STORAGE:
+        print(f"[REF]  Reference BP received | admissionId={adm_id} | SBP={sys_val} DBP={dia_val}")
+        sys.stdout.flush()
+
+        # Trigger an immediate AI confirmation on the next pleth packet ONLY if
+        # the reference values actually changed (new cuff reading from staff).
+        # Do NOT reset if the same value comes in repeatedly — that causes an
+        # infinite loop of immediate checks and repeated ALERT outputs.
+        ref_changed = (abs(prev_ref.get("sbp", 0) - sys_val) >= 5 or
+                       abs(prev_ref.get("dbp", 0) - dia_val) >= 5)
+
+        if session is None:
             _needs_recal = _recal_read(adm_id)
-            SESSION_STORAGE[adm_id] = {
+            session = {
                 "start_time": time.time(),
                 "readings": [],
                 "is_first_reading": {},
@@ -301,18 +322,18 @@ def process_vitals(json_data):
                 "aix_values": [],
                 "aix_history": [],
             }
-        else:
-            SESSION_STORAGE[adm_id]["is_first_reading"] = {}
+        elif ref_changed:
+            # New cuff reading from staff → trigger immediate re-check
+            print(f"[REF]  Reference changed {prev_ref.get('sbp')}/{prev_ref.get('dbp')} -> {sys_val}/{dia_val} | triggering re-check")
+            sys.stdout.flush()
+            session["is_first_reading"] = {}
+        # else: same reference repeated — keep session state, no re-check needed
+
+        _session_write(adm_id, session)
 
         return {
-            "status": "success",
-            "deviceType": "REFERENCE_UPDATE",
+            "status": "ignored",
             "admissionId": adm_id,
-            "bp": {
-                "bpSystolic": sys_val,
-                "bpDiastolic": dia_val,
-                "BP_ERROR": cuff_error
-            },
             "message": f"Reference BP for {adm_id} updated to {sys_val}/{dia_val}. AI will use this for calibration."
         }
 
@@ -352,6 +373,8 @@ def process_vitals(json_data):
         _tail_amp = float(_tail.max() - _tail.min())
         _peaks, _ = signal.find_peaks(_arr, distance=36, height=float(_arr.mean()))
         _is_flat = (_tail_std < 0.01 or _tail_amp < 0.05) or len(_peaks) < 5
+        print(f"[SQI]  adm={adm_id} | device={device_type} | samples={len(_arr)} | std={_tail_std:.4f} | amp={_tail_amp:.4f} | peaks={len(_peaks)} | flat={_is_flat}")
+        sys.stdout.flush()
         if _is_flat:
             _flat_sqi = {"score": 0.0, "valid": False, "flag": "FLAT_SIGNAL"}
             return {**_meta,
@@ -378,6 +401,9 @@ def process_vitals(json_data):
     try:
         # Retrieve the latest reference BP for this patient from Redis
         patient_ref = _ref_read(adm_id)
+        if patient_ref.get("sbp", 0) > 0:
+            print(f"[REF]  Using reference | admissionId={adm_id} | SBP={patient_ref['sbp']} DBP={patient_ref['dbp']}")
+            sys.stdout.flush()
 
         ai_results = ai_engine.analyze(
             pleth_array=model_ready_pleth,
@@ -391,6 +417,11 @@ def process_vitals(json_data):
 
         # 4. CONSOLE LOGGING (STDOUT) - Always visible, not the formal payload
         bp_valid = "sbp" in ai_results
+        if not bp_valid:
+            n_samples = len(model_ready_pleth)
+            reason = "short_packet" if n_samples < 1800 else "insufficient_segments"
+            print(f"[INF]  adm={adm_id} | device={device_type} | samples={n_samples} | inference_failed={reason}")
+            sys.stdout.flush()
         sbp_pred = int(round(float(ai_results.get("sbp", 120)))) if bp_valid else 120
         dbp_pred = int(round(float(ai_results.get("dbp", 80)))) if bp_valid else 80
         hb_pred  = ai_results.get("hb", "N/A") if bp_valid else "N/A"
@@ -417,7 +448,6 @@ def process_vitals(json_data):
                 else:
                     ref_cat = "normal"
                 if model_cat_raw != ref_cat:
-                    m_base_s, m_base_d = cfg.BP_CATEGORY_BASES.get(model_cat_raw, (118.0, 76.0))
                     r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
                     sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
                     dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))
@@ -428,10 +458,11 @@ def process_vitals(json_data):
 
         # 5. INITIALIZE SESSION STATE
         now = time.time()
-        
-        if adm_id not in SESSION_STORAGE:
+
+        session = _session_read(adm_id)
+        if session is None:
             _needs_recal = _recal_read(adm_id)
-            SESSION_STORAGE[adm_id] = {
+            session = {
                 "start_time": now,
                 "readings": [],
                 "is_first_reading": {},
@@ -444,13 +475,12 @@ def process_vitals(json_data):
                 "aix_history": [],
             }
 
-        session = SESSION_STORAGE[adm_id]
-
         # 6. SMART CALIBRATION: first packet per device → immediate check, rest → 15-min window
         has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0
         is_immediate  = has_reference and session["is_first_reading"].get(device_type, True)
 
         if is_immediate and not bp_valid:
+            _session_write(adm_id, session)
             return {**_meta,
                 "status": "poor_signal",
                 "admissionId": adm_id,
@@ -503,6 +533,7 @@ def process_vitals(json_data):
                     alert_payload["hemoglobin"] = hb_pred
                 if glu_pred != "N/A":
                     alert_payload["glucose"] = glu_pred
+                _session_write(adm_id, session)
                 return alert_payload
 
         # First reading matched — subsequent packets from this device go to the window
@@ -523,6 +554,7 @@ def process_vitals(json_data):
         if not is_immediate and elapsed < target_interval:
             trending, morphology = _compute_trends(session)
             if not bp_valid:
+                _session_write(adm_id, session)
                 return {**_meta,
                     "status": "poor_signal",
                     "admissionId": adm_id,
@@ -559,6 +591,7 @@ def process_vitals(json_data):
                 acc["hemoglobin"] = hb_pred
             if glu_pred != "N/A":
                 acc["glucose"] = glu_pred
+            _session_write(adm_id, session)
             return acc
 
         # Timer Expired -> Finalise window trends, then calculate averages
@@ -581,6 +614,7 @@ def process_vitals(json_data):
 
         if not readings:
             session["start_time"] = now
+            _session_write(adm_id, session)
             return {**_meta,
                 "status": "poor_signal",
                 "admissionId": adm_id,
@@ -673,11 +707,14 @@ def process_vitals(json_data):
         if avg_glu != "N/A":
             final_payload["glucose"] = avg_glu
 
+        _session_write(adm_id, session)
         return final_payload
     except Exception as e:
-        if adm_id in SESSION_STORAGE:
-            SESSION_STORAGE[adm_id]["readings"] = []
-            SESSION_STORAGE[adm_id]["start_time"] = time.time()
+        _err_session = _session_read(adm_id)
+        if _err_session is not None:
+            _err_session["readings"] = []
+            _err_session["start_time"] = time.time()
+            _session_write(adm_id, _err_session)
         return {"status": "error", "admissionId": adm_id, "message": f"AI Inference Failed: {str(e)}"}
 
 # ─────────────────────────────────────────────────────────────────────────────

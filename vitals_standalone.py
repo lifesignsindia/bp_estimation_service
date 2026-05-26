@@ -436,23 +436,11 @@ def process_vitals(json_data):
         # AIx from this packet
         aix = _compute_aix(model_ready_pleth, fs=120)
 
-        # Two-path BP correction
+        # No cross-category correction — use raw AI output directly
         ref_s = patient_ref.get("sbp", 0)
         ref_d = patient_ref.get("dbp", 0)
-        if bp_valid:
-            if ref_s > 0 and ref_d > 0:
-                if ref_s < 90 or ref_d < 60:
-                    ref_cat = "hypo"
-                elif ref_s > 130 or ref_d > 80:
-                    ref_cat = "hyper"
-                else:
-                    ref_cat = "normal"
-                if model_cat_raw != ref_cat:
-                    r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
-                    sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
-                    dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))
-            else:
-                sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
+        if bp_valid and not (ref_s > 0 and ref_d > 0):
+            sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
 
         print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
 

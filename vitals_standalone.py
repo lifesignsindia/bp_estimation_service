@@ -74,8 +74,8 @@ try:
         decode_responses=True,
         socket_connect_timeout=5,
         socket_timeout=5,
-        ssl=True,
-        ssl_cert_reqs=None,   # Skip cert verification for internal AWS endpoint
+        ssl=cfg.REDIS_SSL,
+        ssl_cert_reqs=None if cfg.REDIS_SSL else None,
     )
     _redis.ping()
     print("[REDIS] Connected OK.")
@@ -157,14 +157,14 @@ def _preprocess_signal(raw_pleth, source_hz, target_hz, device_type):
 
     # 1. BERRYMED (NISO 101)
     if device_type == DEVICE_BERRYMED:
-        filtered = PROCESSORS["BERRYMED"].process(raw_pleth)
-        # Normalize to 0-1 to match CHECKME and NISO204 output scale
-        filtered_arr = np.array(filtered, dtype=float)
-        p2, p98 = np.percentile(filtered_arr, [2, 98])
+        from scipy.signal import medfilt as _medfilt
+        raw_arr  = np.array(raw_pleth, dtype=float)
+        despiked = _medfilt(raw_arr, kernel_size=5)
+        p2, p98  = np.percentile(despiked, [2, 98])
         if p98 - p2 > 1e-6:
-            clean_signal = np.clip((filtered_arr - p2) / (p98 - p2), 0, 1)
+            clean_signal = np.clip((despiked - p2) / (p98 - p2), 0, 1)
         else:
-            clean_signal = filtered_arr
+            clean_signal = despiked
         
     # 2. CHECKME (NISO 103)
     elif device_type == DEVICE_CHECKME:
@@ -183,7 +183,8 @@ def _preprocess_signal(raw_pleth, source_hz, target_hz, device_type):
     # FINAL STEP FOR ALL DEVICES: Resample to exact target_hz (120 Hz)
     if source_hz != target_hz and len(clean_signal) > 0:
         target_length = int(len(clean_signal) * (target_hz / source_hz))
-        return list(signal.resample(clean_signal, target_length)), sqi_info
+        resampled = signal.resample(np.array(clean_signal, dtype=float), target_length)
+        return list(resampled), sqi_info
         
     return list(clean_signal), sqi_info
 
@@ -260,7 +261,7 @@ def process_vitals(json_data):
     device_type = _detect_device(json_data)
 
     # --- PATHWAY 1: THE BP CUFF (Update Reference Storage) ---
-    if device_type == DEVICE_LS06 or "bp" in json_data:
+    if device_type == DEVICE_LS06:
         bp_block = json_data.get("bp", {}) or json_data
         sys_val    = int(bp_block.get("BPSYS",  bp_block.get("bpSystolic",  bp_block.get("BPSystolic",  0))))
         dia_val    = int(bp_block.get("BPDIA",  bp_block.get("bpDiastolic", bp_block.get("BPDiastolic", 0))))
@@ -436,13 +437,27 @@ def process_vitals(json_data):
         # AIx from this packet
         aix = _compute_aix(model_ready_pleth, fs=120)
 
-        # No cross-category correction — use raw AI output directly
+        # Cross-category correction: if ref category differs from model category,
+        # re-root the AI's delta onto the reference category base
         ref_s = patient_ref.get("sbp", 0)
         ref_d = patient_ref.get("dbp", 0)
-        if bp_valid and not (ref_s > 0 and ref_d > 0):
-            sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
-
-        print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
+        ai_sbp_raw = sbp_pred
+        ai_dbp_raw = dbp_pred
+        if bp_valid and ref_s > 0 and ref_d > 0:
+            if ref_s < 90 or ref_d < 60:
+                ref_cat = "hypo"
+            elif ref_s > 140 or ref_d > 90:
+                ref_cat = "hyper"
+            else:
+                ref_cat = "normal"
+            if model_cat_raw != ref_cat:
+                r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
+                sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
+                dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))
+        # elif bp_valid and not (ref_s > 0 and ref_d > 0):
+        #     sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
+        # NOTE: Empirical bias offset disabled — causes artificial inflation (up to +25 SBP / +15 DBP)
+        #       when no reference is set. Raw AI output is used directly instead.
 
         # 5. INITIALIZE SESSION STATE
         now = time.time()
@@ -463,7 +478,7 @@ def process_vitals(json_data):
                 "aix_history": [],
             }
 
-        # 6. SMART CALIBRATION: first packet per device → immediate check, rest → 15-min window
+        # 6. SESSION FLAGS
         has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0
         is_immediate  = has_reference and session["is_first_reading"].get(device_type, True)
 
@@ -476,29 +491,31 @@ def process_vitals(json_data):
                 "deviceType": "BP_SPO2",
                 "timestamp": int(now),
                 "sqi": sqi_info,
-                "message": "Poor signal on first packet. Waiting for clean signal before calibration check."
+                "message": "Poor signal on first packet. Waiting for clean signal."
             }
 
-        if is_immediate:
+        print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
+        sys.stdout.flush()
+
+        # First reading check — identical logic to test_pipeline
+        if is_immediate and bp_valid:
             ref_sbp = patient_ref.get("sbp", 0)
             ref_dbp = patient_ref.get("dbp", 0)
-
             if ref_sbp > 0 or ref_dbp > 0:
+                # Has reference: compare AI output vs cuff reading
                 sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - sbp_pred) >= 15)
                 dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - dbp_pred) >= 15)
+                alert_msg = f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={sbp_pred}/{dbp_pred}."
             else:
+                # No reference: physiological range check
                 sbp_mismatch = (sbp_pred > 140 or sbp_pred < 90)
                 dbp_mismatch = (dbp_pred > 90  or dbp_pred < 60)
+                alert_msg = f"Physiological Alert: AI={sbp_pred}/{dbp_pred} outside normal range."
 
             if sbp_mismatch or dbp_mismatch:
                 session["needs_recalibration"] = True
                 session["is_first_reading"][device_type] = False
                 _recal_write(adm_id, True)
-                alert_msg = (
-                    f"Physiological Alert: AI={sbp_pred}/{dbp_pred} outside normal range."
-                    if ref_sbp == 0 and ref_dbp == 0
-                    else f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={sbp_pred}/{dbp_pred}."
-                )
                 alert_payload = {**_meta,
                     "status": "alert",
                     "admissionId": adm_id,
@@ -524,7 +541,7 @@ def process_vitals(json_data):
                 _session_write(adm_id, session)
                 return alert_payload
 
-        # First reading matched — subsequent packets from this device go to the window
+        # First reading done — subsequent packets from this device go to the window
         if is_immediate:
             session["is_first_reading"][device_type] = False
 

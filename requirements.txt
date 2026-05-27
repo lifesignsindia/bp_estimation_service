@@ -1,8 +1,8 @@
-numpy>=2.0
-scipy
+numpy==2.1.3
+scipy==1.16.0
 joblib
 scikit-learn==1.7.1
-xgboost
+xgboost==3.0.3
 confluent-kafka
 redis
 python-dotenv

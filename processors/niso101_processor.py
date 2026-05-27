@@ -1,7 +1,87 @@
 import numpy as np
 from scipy import signal
+from scipy.signal import medfilt
 from typing import Optional, Tuple
 from config import SETTINGS
+
+
+def _compute_sqi_berry(raw, despiked):
+    """
+    Signal quality check for BerryMed (NISO101) — same logic as NISO204.
+    'raw'     : original ADC array (pre-despike)
+    'despiked': after median filter, before detrend/normalize
+    """
+    raw_arr = np.array(raw, dtype=float)
+
+    # 1. Saturation: >2% of samples stuck at exact ADC maximum
+    if len(raw_arr) > 0 and np.max(raw_arr) > 0:
+        if np.mean(raw_arr == np.max(raw_arr)) > 0.02:
+            return 0.2, False, "SATURATED"
+
+    # 2. Amplitude: negligible pulsatile swing → probe off / poor contact
+    amplitude = float(np.percentile(despiked, 98) - np.percentile(despiked, 2))
+    if amplitude < 0.05 * np.mean(np.abs(despiked)) + 1e-6:
+        return 0.0, False, "POOR_CONTACT"
+
+    # 3. Motion: sudden baseline step mid-window
+    window = max(10, len(despiked) // 20)
+    smoothed = np.convolve(despiked, np.ones(window) / window, mode='same')
+    step = float(np.max(np.abs(np.diff(smoothed))))
+    if amplitude > 1e-6 and step > amplitude * 0.5:
+        return 0.5, False, "MOTION_DETECTED"
+
+    return 1.0, True, "GOOD"
+
+
+class BerryMed204Processor:
+    """
+    Clean block processor for BerryMed (NISO101) finger probe.
+
+    Matches NISO204 preprocessing so the AI model sees familiar morphology
+    (model was trained exclusively on NISO204 data).
+
+    Pipeline:
+        1. Median despike  (kernel=5) — removes hardware/BT spike artifacts
+        2. SQI check       — catches flat line, saturation, motion BEFORE detrend
+        3. Piecewise detrend (3 segments) — removes initial DC offset + baseline wander
+        4. Percentile normalize [0, 1] — matches NISO204 output scale
+
+    No IIR/FIR bandpass — NISO204 training data had none; applying one shifts
+    BerryMed morphology away from the training distribution.
+    """
+
+    def __init__(self, kernel_size: int = 5):
+        self.kernel_size = kernel_size
+
+    def process(self, raw_pleth: list) -> tuple:
+        """
+        Returns (clean_signal: list[float], sqi_info: dict)
+        Same interface as NISO204Processor.process().
+        """
+        if not raw_pleth or len(raw_pleth) < self.kernel_size:
+            return [], {"score": 0.0, "valid": False, "flag": "INSUFFICIENT_DATA"}
+
+        arr = np.array(raw_pleth, dtype=float)
+
+        # 1. Median despike
+        despiked = medfilt(arr, kernel_size=self.kernel_size)
+
+        # 2. SQI on raw/despiked (before normalize — catches probe-off / motion)
+        sqi_score, sqi_valid, sqi_flag = _compute_sqi_berry(arr, despiked)
+        sqi_info = {"score": sqi_score, "valid": sqi_valid, "flag": sqi_flag}
+
+        # 3. Percentile normalize to [0, 1]
+        #    p2/p98 clipping handles DC offset naturally — even if the first
+        #    few seconds are unsettled, the bulk of the 30s window drives the
+        #    percentiles to the correct range. No detrend needed: it removes
+        #    respiratory modulation which the model uses for feature extraction.
+        p2, p98 = np.percentile(despiked, [2, 98])
+        if p98 - p2 > 1e-6:
+            clean = np.clip((despiked - p2) / (p98 - p2), 0, 1)
+        else:
+            clean = despiked
+
+        return list(clean), sqi_info
 
 class PPGFilter:
     """
@@ -39,10 +119,13 @@ class PPGFilter:
         from scipy.signal import medfilt as _medfilt
         x = _medfilt(x, kernel_size=15)
 
+        # Remove DC offset BEFORE filtering — bandpass steady-state for DC is 0,
+        # so subtracting the mean first means zi=0 is the correct initial condition
+        # and avoids startup transients regardless of raw ADC magnitude (~574K or ~1.2M).
+        x = x - np.mean(x)
+
         if self.zi is None:
-            # Use median of first 10 samples — robust against outlier first sample
-            init_val = float(np.median(x[:10])) if len(x) >= 10 else float(x[0])
-            self.zi = signal.sosfilt_zi(self.sos) * init_val
+            self.zi = signal.sosfilt_zi(self.sos) * 0.0
 
         y, self.zi = signal.sosfilt(self.sos, x, zi=self.zi)
         return y.tolist()

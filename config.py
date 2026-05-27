@@ -40,6 +40,10 @@ BP_CATEGORY_BASES = {
 # "normal" base regardless of device type
 BP_CONFIDENCE_THRESHOLD = 0.50
 
+# BerryMed preprocessing was fixed to match NISO204 (median despike + normalize only,
+# no IIR filter). Confidence threshold is now the same as other devices.
+BP_BERRYMED_CONFIDENCE_THRESHOLD = 0.50
+
 # ─── Hardware Sentinels (Invalid Values) ─────────────────────────────────────
 BERRY_SPO2_INVALID      = 127
 BERRY_HR_INVALID        = 255
@@ -72,6 +76,7 @@ HB_GLU_MODEL_CONFIG = {
 REDIS_HOST     = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT     = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+REDIS_SSL      = os.getenv("REDIS_SSL", "false").lower() == "true"
 REDIS_REF_TTL  = 86400  # 24 hours per clinical session
 
 # ─── Kafka ────────────────────────────────────────────────────────────────────

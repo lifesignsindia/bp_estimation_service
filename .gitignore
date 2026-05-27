@@ -22,5 +22,6 @@ test_app/static/plots/
 test_app/
 dev.estimated_bp_unfiltered_data.json
 test_local.py
-\
 
+sample_payloads/ls06_sample.json
+sample_ref.json

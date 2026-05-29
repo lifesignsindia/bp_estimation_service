@@ -71,11 +71,12 @@ try:
     _redis = redis_lib.Redis(
         host=cfg.REDIS_HOST,
         port=cfg.REDIS_PORT,
+        password=cfg.REDIS_PASSWORD,
         decode_responses=True,
         socket_connect_timeout=5,
         socket_timeout=5,
         ssl=cfg.REDIS_SSL,
-        ssl_cert_reqs=None if cfg.REDIS_SSL else None,
+        ssl_cert_reqs="none" if cfg.REDIS_SSL else None,
     )
     _redis.ping()
     print("[REDIS] Connected OK.")

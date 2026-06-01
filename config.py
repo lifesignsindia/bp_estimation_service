@@ -75,6 +75,7 @@ HB_GLU_MODEL_CONFIG = {
 # ─── Redis — Reference BP Persistence ────────────────────────────────────────
 REDIS_HOST     = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT     = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 REDIS_SSL      = os.getenv("REDIS_SSL", "false").lower() == "true"
 REDIS_REF_TTL  = 86400  # 24 hours per clinical session
 

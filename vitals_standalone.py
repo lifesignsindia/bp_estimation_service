@@ -75,6 +75,9 @@ try:
         "socket_connect_timeout": 5,
         "socket_timeout": 5,
     }
+    # Only add password if it's actually set (not None/empty)
+    if getattr(cfg, "REDIS_PASSWORD", None):
+        redis_kwargs["password"] = cfg.REDIS_PASSWORD
     if getattr(cfg, "REDIS_SSL", False):
         redis_kwargs["ssl"] = True
         redis_kwargs["ssl_cert_reqs"] = None

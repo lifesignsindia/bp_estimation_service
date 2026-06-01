@@ -20,5 +20,6 @@ ENV REDIS_TLS=false
 # Optional Redis settings:
 # ENV REDIS_PASSWORD=
 # ENV REDIS_URL=redis://redis:6379
+# Cloud-managed hosts (e.g. AWS ElastiCache) auto-enable TLS when REDIS_HOST matches a managed endpoint.
 
 CMD ["python", "kafka_consumer.py"]

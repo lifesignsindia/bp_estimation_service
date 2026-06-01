@@ -86,6 +86,8 @@ _validate_redis_configuration()
 print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}... {'(TLS)' if getattr(cfg, 'REDIS_TLS', False) else ''}")
 if getattr(cfg, "REDIS_URL", None):
     print(f"[REDIS] Using REDIS_URL={cfg.REDIS_URL}")
+if getattr(cfg, "REDIS_TLS", False) and not getattr(cfg, "REDIS_URL", None):
+    print("[REDIS] TLS mode enabled via REDIS_TLS=true")
 sys.stdout.flush()
 try:
     redis_kwargs = {

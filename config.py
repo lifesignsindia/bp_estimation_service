@@ -3,6 +3,7 @@ config.py - Central configuration for the Vitals Inference Pipeline.
 """
 
 import os
+import urllib.parse
 
 # ─── Processor Settings ──────────────────────────────────────────────────────
 class SETTINGS:
@@ -76,7 +77,20 @@ HB_GLU_MODEL_CONFIG = {
 REDIS_HOST     = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT     = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+REDIS_URL      = os.getenv("REDIS_URL", None)
 REDIS_REF_TTL  = 86400  # 24 hours per clinical session
+
+if REDIS_URL:
+    parsed = urllib.parse.urlparse(REDIS_URL)
+    if parsed.scheme in ("redis", "rediss"):
+        REDIS_HOST = parsed.hostname or REDIS_HOST
+        REDIS_PORT = int(parsed.port or REDIS_PORT)
+        REDIS_PASSWORD = parsed.password or REDIS_PASSWORD
+        REDIS_TLS = parsed.scheme == "rediss"
+    else:
+        REDIS_TLS = False
+else:
+    REDIS_TLS = False
 
 # ─── Kafka ────────────────────────────────────────────────────────────────────
 KAFKA_BROKERS      = os.getenv("KAFKA_BROKERS",      "localhost:9092")

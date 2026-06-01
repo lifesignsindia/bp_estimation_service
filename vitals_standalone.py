@@ -65,7 +65,19 @@ _DEVICE_NAME_MAP = {
 }
 
 # ─── Redis ────────────────────────────────────────────────────────────────────
-print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}...")
+
+def _validate_redis_configuration():
+    if not getattr(cfg, "REDIS_URL", None):
+        if cfg.REDIS_HOST in {"localhost", "127.0.0.1"}:
+            print("[REDIS] WARNING: REDIS_HOST is set to localhost. In container deployment, set REDIS_HOST=redis or REDIS_URL=redis://redis:6379.")
+            print("[REDIS] If Redis is external, configure REDIS_HOST/REDIS_PORT or REDIS_URL correctly.")
+            sys.stdout.flush()
+
+
+_validate_redis_configuration()
+print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}... {'(TLS)' if getattr(cfg, 'REDIS_TLS', False) else ''}")
+if getattr(cfg, "REDIS_URL", None):
+    print(f"[REDIS] Using REDIS_URL={cfg.REDIS_URL}")
 sys.stdout.flush()
 try:
     redis_kwargs = {
@@ -75,16 +87,19 @@ try:
         "socket_connect_timeout": 5,
         "socket_timeout": 5,
     }
-    # Only add password if it's actually set (not None/empty)
     if getattr(cfg, "REDIS_PASSWORD", None):
         redis_kwargs["password"] = cfg.REDIS_PASSWORD
+    if getattr(cfg, "REDIS_TLS", False):
+        redis_kwargs["ssl"] = True
 
     _redis = redis_lib.Redis(**redis_kwargs)
     _redis.ping()
     print("[REDIS] Connected OK.")
     sys.stdout.flush()
 except Exception as e:
-    print(f"[REDIS] FATAL: Cannot connect — {type(e).__name__}: {e}")
+    print("[REDIS] FATAL: Cannot connect to Redis. Verify REDIS_HOST/REDIS_PORT or REDIS_URL and ensure Redis is reachable from this container.")
+    print(f"[REDIS] Current config: REDIS_HOST={cfg.REDIS_HOST}, REDIS_PORT={cfg.REDIS_PORT}, REDIS_URL={getattr(cfg, 'REDIS_URL', None)}, REDIS_TLS={getattr(cfg, 'REDIS_TLS', False)}")
+    print(f"[REDIS] Error: {type(e).__name__}: {e}")
     if hasattr(e, "__cause__") and e.__cause__:
         print(f"[REDIS] Cause: {type(e.__cause__).__name__}: {e.__cause__}")
     sys.stdout.flush()

@@ -78,6 +78,7 @@ REDIS_HOST     = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT     = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 REDIS_URL      = os.getenv("REDIS_URL", None)
+REDIS_TLS      = os.getenv("REDIS_TLS", "false").lower() in ("1", "true", "yes", "on")
 REDIS_REF_TTL  = 86400  # 24 hours per clinical session
 
 if REDIS_URL:
@@ -88,9 +89,7 @@ if REDIS_URL:
         REDIS_PASSWORD = parsed.password or REDIS_PASSWORD
         REDIS_TLS = parsed.scheme == "rediss"
     else:
-        REDIS_TLS = False
-else:
-    REDIS_TLS = False
+        REDIS_TLS = REDIS_TLS
 
 # ─── Kafka ────────────────────────────────────────────────────────────────────
 KAFKA_BROKERS      = os.getenv("KAFKA_BROKERS",      "localhost:9092")

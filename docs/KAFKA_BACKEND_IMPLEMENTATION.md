@@ -206,7 +206,6 @@ Partition key = `admissionId` (UTF-8). Flush every 50 messages.
 | `KAFKA_GROUP_ID` | `vitals-pipeline` | Consumer group ID |
 | `REDIS_HOST` | `localhost` | Redis hostname |
 | `REDIS_PORT` | `6379` | Redis port |
-| `REDIS_PASSWORD` | _(none)_ | Redis password (optional) |
 
 In Docker: injected via `environment` block in `docker-compose.yml`.
 Inside Docker network: `KAFKA_BROKERS=kafka:29092`, `REDIS_HOST=redis`.

@@ -68,16 +68,22 @@ _DEVICE_NAME_MAP = {
 print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}...")
 sys.stdout.flush()
 try:
-    _redis = redis_lib.Redis(
-        host=cfg.REDIS_HOST,
-        port=cfg.REDIS_PORT,
-        password=cfg.REDIS_PASSWORD,
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_timeout=5,
-        ssl=cfg.REDIS_SSL,
-        ssl_cert_reqs="none" if cfg.REDIS_SSL else None,
-    )
+    redis_kwargs = {
+        "host": cfg.REDIS_HOST,
+        "port": cfg.REDIS_PORT,
+        "decode_responses": True,
+        "socket_connect_timeout": 5,
+        "socket_timeout": 5,
+        "ssl": cfg.REDIS_SSL,
+    }
+    # Only add password if it's actually set (not None)
+    if cfg.REDIS_PASSWORD is not None:
+        redis_kwargs["password"] = cfg.REDIS_PASSWORD
+    # Only add ssl_cert_reqs if SSL is enabled
+    if cfg.REDIS_SSL:
+        redis_kwargs["ssl_cert_reqs"] = "none"
+    
+    _redis = redis_lib.Redis(**redis_kwargs)
     _redis.ping()
     print("[REDIS] Connected OK.")
     sys.stdout.flush()
@@ -138,9 +144,41 @@ _DEVICE_HZ_MAP = {
 def _detect_device(json_data):
     # Check deviceName first — NISO101/103/204 are PPG devices, never cuff.
     # If deviceName is known, route directly regardless of any bp field in payload.
-    device_name = json_data.get("deviceName", "")
+    device_name = json_data.get("deviceName")
+    if isinstance(device_name, str):
+        device_name = device_name.strip()
+    else:
+        device_name = ""
     if device_name in _DEVICE_INPUT_MAP:
         return _DEVICE_INPUT_MAP[device_name]
+
+    # Some payloads omit deviceName but still carry deviceType or nested device metadata.
+    device_type = json_data.get("deviceType")
+    if isinstance(device_type, str):
+        device_type = device_type.strip()
+    else:
+        device_type = ""
+    if device_type in _DEVICE_INPUT_MAP:
+        return _DEVICE_INPUT_MAP[device_type]
+    if device_type in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+        return device_type
+
+    device_block = json_data.get("device")
+    if isinstance(device_block, dict):
+        nested_name = device_block.get("deviceType")
+        if isinstance(nested_name, str):
+            nested_name = nested_name.strip()
+            if nested_name in _DEVICE_INPUT_MAP:
+                return _DEVICE_INPUT_MAP[nested_name]
+            if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+                return nested_name
+    elif isinstance(device_block, str):
+        nested_name = device_block.strip()
+        if nested_name in _DEVICE_INPUT_MAP:
+            return _DEVICE_INPUT_MAP[nested_name]
+        if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+            return nested_name
+
     # No recognised deviceName — fall back to bp field presence (LS06 cuff)
     if "bp" in json_data:
         return DEVICE_LS06
@@ -229,6 +267,25 @@ def _apply_bp_offset(sbp, dbp):
     offset_d = float(np.interp(dbp, [45.0, 60.0], [15.0, 0.0]))
     return (int(round(float(np.clip(sbp + offset_s, *cfg.BP_SBP_LIMITS)))),
             int(round(float(np.clip(dbp + offset_d, *cfg.BP_DBP_LIMITS)))))
+
+
+def _blend_with_reference(sbp, dbp, ref_sbp, ref_dbp):
+    if not (ref_sbp > 0 or ref_dbp > 0):
+        return int(round(float(sbp))), int(round(float(dbp)))
+
+    sbp_float = float(sbp)
+    dbp_float = float(dbp)
+    ref_sbp_float = float(ref_sbp)
+    ref_dbp_float = float(ref_dbp)
+
+    sbp_gap = abs(sbp_float - ref_sbp_float)
+    dbp_gap = abs(dbp_float - ref_dbp_float)
+    blend_weight = 0.50 if (sbp_gap >= 15 or dbp_gap >= 10) else 0.35
+
+    cal_sbp = int(round((1.0 - blend_weight) * sbp_float + blend_weight * ref_sbp_float))
+    cal_dbp = int(round((1.0 - blend_weight) * dbp_float + blend_weight * ref_dbp_float))
+    return (int(np.clip(cal_sbp, *cfg.BP_SBP_LIMITS)),
+            int(np.clip(cal_dbp, *cfg.BP_DBP_LIMITS)))
 
 
 def _compute_trends(session):
@@ -455,6 +512,11 @@ def process_vitals(json_data):
                 r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
                 sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
                 dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))
+
+        raw_sbp_pred = sbp_pred
+        raw_dbp_pred = dbp_pred
+        if ref_s > 0 and ref_d > 0:
+            sbp_pred, dbp_pred = _blend_with_reference(raw_sbp_pred, raw_dbp_pred, ref_s, ref_d)
         # elif bp_valid and not (ref_s > 0 and ref_d > 0):
         #     sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
         # NOTE: Empirical bias offset disabled — causes artificial inflation (up to +25 SBP / +15 DBP)
@@ -503,15 +565,15 @@ def process_vitals(json_data):
             ref_sbp = patient_ref.get("sbp", 0)
             ref_dbp = patient_ref.get("dbp", 0)
             if ref_sbp > 0 or ref_dbp > 0:
-                # Has reference: compare AI output vs cuff reading
-                sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - sbp_pred) >= 15)
-                dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - dbp_pred) >= 15)
-                alert_msg = f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={sbp_pred}/{dbp_pred}."
+                # Has reference: compare raw AI output vs cuff reading
+                sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - raw_sbp_pred) >= 15)
+                dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - raw_dbp_pred) >= 10)
+                alert_msg = f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={raw_sbp_pred}/{raw_dbp_pred}."
             else:
                 # No reference: physiological range check
-                sbp_mismatch = (sbp_pred > 140 or sbp_pred < 90)
-                dbp_mismatch = (dbp_pred > 90  or dbp_pred < 60)
-                alert_msg = f"Physiological Alert: AI={sbp_pred}/{dbp_pred} outside normal range."
+                sbp_mismatch = (raw_sbp_pred > 140 or raw_sbp_pred < 90)
+                dbp_mismatch = (raw_dbp_pred > 90  or raw_dbp_pred < 60)
+                alert_msg = f"Physiological Alert: AI={raw_sbp_pred}/{raw_dbp_pred} outside normal range."
 
             if sbp_mismatch or dbp_mismatch:
                 session["needs_recalibration"] = True

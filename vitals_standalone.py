@@ -68,22 +68,13 @@ _DEVICE_NAME_MAP = {
 print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}...")
 sys.stdout.flush()
 try:
-    redis_kwargs = {
-        "host": cfg.REDIS_HOST,
-        "port": cfg.REDIS_PORT,
-        "decode_responses": True,
-        "socket_connect_timeout": 5,
-        "socket_timeout": 5,
-        "ssl": cfg.REDIS_SSL,
-    }
-    # Only add password if it's actually set (not None)
-    if cfg.REDIS_PASSWORD is not None:
-        redis_kwargs["password"] = cfg.REDIS_PASSWORD
-    # Only add ssl_cert_reqs if SSL is enabled
-    if cfg.REDIS_SSL:
-        redis_kwargs["ssl_cert_reqs"] = "none"
-    
-    _redis = redis_lib.Redis(**redis_kwargs)
+    _redis = redis_lib.Redis(
+        host=cfg.REDIS_HOST,
+        port=cfg.REDIS_PORT,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
     _redis.ping()
     print("[REDIS] Connected OK.")
     sys.stdout.flush()

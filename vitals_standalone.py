@@ -167,8 +167,32 @@ _DEVICE_HZ_MAP = {
 }
 
 def _detect_device(json_data):
-    # Check deviceName first — NISO101/103/204 are PPG devices, never cuff.
-    # If deviceName is known, route directly regardless of any bp field in payload.
+    # Check nested device object first — future payloads may move device metadata under `device`.
+    device_block = json_data.get("device")
+    if isinstance(device_block, dict):
+        nested_name = device_block.get("deviceName")
+        if isinstance(nested_name, str):
+            nested_name = nested_name.strip()
+            if nested_name in _DEVICE_INPUT_MAP:
+                return _DEVICE_INPUT_MAP[nested_name]
+            if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+                return nested_name
+
+        nested_type = device_block.get("deviceType")
+        if isinstance(nested_type, str):
+            nested_type = nested_type.strip()
+            if nested_type in _DEVICE_INPUT_MAP:
+                return _DEVICE_INPUT_MAP[nested_type]
+            if nested_type in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+                return nested_type
+    elif isinstance(device_block, str):
+        nested_name = device_block.strip()
+        if nested_name in _DEVICE_INPUT_MAP:
+            return _DEVICE_INPUT_MAP[nested_name]
+        if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+            return nested_name
+
+    # Legacy support: top-level deviceName and deviceType remain valid.
     device_name = json_data.get("deviceName")
     if isinstance(device_name, str):
         device_name = device_name.strip()
@@ -176,8 +200,9 @@ def _detect_device(json_data):
         device_name = ""
     if device_name in _DEVICE_INPUT_MAP:
         return _DEVICE_INPUT_MAP[device_name]
+    if device_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+        return device_name
 
-    # Some payloads omit deviceName but still carry deviceType or nested device metadata.
     device_type = json_data.get("deviceType")
     if isinstance(device_type, str):
         device_type = device_type.strip()
@@ -187,22 +212,6 @@ def _detect_device(json_data):
         return _DEVICE_INPUT_MAP[device_type]
     if device_type in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
         return device_type
-
-    device_block = json_data.get("device")
-    if isinstance(device_block, dict):
-        nested_name = device_block.get("deviceType")
-        if isinstance(nested_name, str):
-            nested_name = nested_name.strip()
-            if nested_name in _DEVICE_INPUT_MAP:
-                return _DEVICE_INPUT_MAP[nested_name]
-            if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
-                return nested_name
-    elif isinstance(device_block, str):
-        nested_name = device_block.strip()
-        if nested_name in _DEVICE_INPUT_MAP:
-            return _DEVICE_INPUT_MAP[nested_name]
-        if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
-            return nested_name
 
     # No recognised deviceName — fall back to bp field presence (LS06 cuff)
     if "bp" in json_data:

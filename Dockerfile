@@ -18,6 +18,6 @@ ENV PYTHONUNBUFFERED=1
 # ENV REDIS_PORT=6379
 # Optional Redis settings:
 # ENV REDIS_PASSWORD=
-# ENV REDIS_SSL=false
+
 
 CMD ["python", "kafka_consumer.py"]

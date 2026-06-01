@@ -13,9 +13,8 @@ except Exception as e:
 host = os.getenv("REDIS_HOST", "localhost")
 port = int(os.getenv("REDIS_PORT", "6379"))
 pwd = os.getenv("REDIS_PASSWORD") or None
-ssl_env = os.getenv("REDIS_SSL", "false").lower() == "true"
 
-def try_conn(use_ssl):
+def try_conn():
     kwargs = {
         "host": host,
         "port": port,
@@ -25,22 +24,12 @@ def try_conn(use_ssl):
     }
     if pwd:
         kwargs["password"] = pwd
-    if use_ssl:
-        kwargs["ssl"] = True
-        kwargs["ssl_cert_reqs"] = None
-    mode = "TLS" if use_ssl else "plain"
-    print(f"Trying {mode} connection to {host}:{port} (password={'set' if pwd else 'none'})...")
+    print(f"Trying plain connection to {host}:{port} (password={'set' if pwd else 'none'})...")
     try:
         r = redis.Redis(**kwargs)
         pong = r.ping()
-        print("PONG (mode=", mode, ") =>", pong)
+        print("PONG =>", pong)
     except Exception as e:
-        print(f"ERROR ({mode}): {type(e).__name__}: {e}")
+        print(f"ERROR: {type(e).__name__}: {e}")
 
-if ssl_env:
-    try_conn(True)
-else:
-    # try plaintext first, then TLS to help diagnose mismatch
-    try_conn(False)
-    print("--- now attempting TLS as well (diagnostic) ---")
-    try_conn(True)
+try_conn()

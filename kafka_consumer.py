@@ -18,6 +18,7 @@ print("[CFG]  KAFKA_GROUP_ID     =", cfg.KAFKA_GROUP_ID)
 print("[CFG]  KAFKA_DEBUG_TOPIC  =", cfg.KAFKA_DEBUG_TOPIC or "(disabled)")
 print("[CFG]  REDIS_HOST         =", cfg.REDIS_HOST)
 print("[CFG]  REDIS_PORT         =", cfg.REDIS_PORT)
+print("[CFG]  REDIS_SSL          =", cfg.REDIS_SSL)
 print("[CFG]  ============================================================")
 sys.stdout.flush()
 

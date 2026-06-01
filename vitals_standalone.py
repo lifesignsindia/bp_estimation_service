@@ -65,7 +65,7 @@ _DEVICE_NAME_MAP = {
 }
 
 # ─── Redis ────────────────────────────────────────────────────────────────────
-print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}...")
+print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT} (ssl={cfg.REDIS_SSL})...")
 sys.stdout.flush()
 try:
     redis_kwargs = {
@@ -84,7 +84,9 @@ try:
     print("[REDIS] Connected OK.")
     sys.stdout.flush()
 except Exception as e:
-    print(f"[REDIS] FATAL: Cannot connect — {e}")
+    print(f"[REDIS] FATAL: Cannot connect — {type(e).__name__}: {e}")
+    if hasattr(e, "__cause__") and e.__cause__:
+        print(f"[REDIS] Cause: {type(e.__cause__).__name__}: {e.__cause__}")
     sys.stdout.flush()
     sys.exit(1)
 

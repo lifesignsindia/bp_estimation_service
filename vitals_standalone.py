@@ -74,7 +74,6 @@ try:
         "decode_responses": True,
         "socket_connect_timeout": 5,
         "socket_timeout": 5,
-        "retry_on_timeout": True,
     }
     if getattr(cfg, "REDIS_SSL", False):
         redis_kwargs["ssl"] = True

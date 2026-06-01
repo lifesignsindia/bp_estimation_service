@@ -68,13 +68,19 @@ _DEVICE_NAME_MAP = {
 print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}...")
 sys.stdout.flush()
 try:
-    _redis = redis_lib.Redis(
-        host=cfg.REDIS_HOST,
-        port=cfg.REDIS_PORT,
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_timeout=5,
-    )
+    redis_kwargs = {
+        "host": cfg.REDIS_HOST,
+        "port": cfg.REDIS_PORT,
+        "decode_responses": True,
+        "socket_connect_timeout": 5,
+        "socket_timeout": 5,
+        "retry_on_timeout": True,
+    }
+    if getattr(cfg, "REDIS_SSL", False):
+        redis_kwargs["ssl"] = True
+        redis_kwargs["ssl_cert_reqs"] = None
+
+    _redis = redis_lib.Redis(**redis_kwargs)
     _redis.ping()
     print("[REDIS] Connected OK.")
     sys.stdout.flush()

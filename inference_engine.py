@@ -531,10 +531,11 @@ class VitalInferenceEngine:
         clean_lbls = [seg_preds[i]["label"] for i,m in enumerate(mask) if m]
         category   = Counter(clean_lbls).most_common(1)[0][0]
 
-        # Confidence fallback: all devices — if classifier is uncertain, use "normal" base
+        # Confidence fallback: if classifier is uncertain, fall back to "normal" base.
         all_probas = np.array([r["proba"] for r in seg_preds])
         mean_proba = np.mean(all_probas, axis=0)
-        if category in ("hypo", "hyper") and float(mean_proba.max()) < cfg.BP_CONFIDENCE_THRESHOLD:
+        conf_used = float(mean_proba.max())
+        if category in ("hypo", "hyper") and conf_used < cfg.BP_CONFIDENCE_THRESHOLD:
             category = "normal"
 
         # Base + clipped delta → final BP (values from config)

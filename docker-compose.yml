@@ -52,4 +52,8 @@ services:
       KAFKA_DEBUG_TOPIC: vitals.debug
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      REDIS_TLS: "false"
+      # Optional for TLS-enabled Redis:
+      # REDIS_URL: rediss://<host>:6379
+      # REDIS_TLS: "true"
     restart: on-failure

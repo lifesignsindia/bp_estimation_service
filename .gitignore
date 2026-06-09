@@ -21,6 +21,10 @@ settings.local.json
 test_app/static/plots/
 test_app/
 dev.estimated_bp_unfiltered_data.json
-test_local.py
-\
+test_local.pyT
 
+sample_payloads/ls06_sample.json
+sample_ref.json
+new.json
+test_local.py
+docs/KAFKA_BACKEND_IMPLEMENTATION.md

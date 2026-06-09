@@ -65,23 +65,55 @@ _DEVICE_NAME_MAP = {
 }
 
 # ─── Redis ────────────────────────────────────────────────────────────────────
-print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}...")
+
+def _validate_redis_configuration():
+    cloud_redis = isinstance(cfg.REDIS_HOST, str) and (
+        cfg.REDIS_HOST.endswith(".cache.amazonaws.com") or
+        cfg.REDIS_HOST.endswith(".redis.cache.windows.net") or
+        cfg.REDIS_HOST.endswith(".redis.cache.azure.com")
+    )
+    if not getattr(cfg, "REDIS_URL", None):
+        if cfg.REDIS_HOST in {"localhost", "127.0.0.1"}:
+            print("[REDIS] WARNING: REDIS_HOST is set to localhost. In container deployment, set REDIS_HOST=redis or REDIS_URL=redis://redis:6379.")
+            print("[REDIS] If Redis is external, configure REDIS_HOST/REDIS_PORT or REDIS_URL correctly.")
+            sys.stdout.flush()
+        elif cloud_redis and not getattr(cfg, "REDIS_TLS", False):
+            print("[REDIS] WARNING: Cloud Redis host detected but REDIS_TLS=false. If this is AWS ElastiCache or another managed service, use REDIS_TLS=true or REDIS_URL=rediss://<host>:6379.")
+            sys.stdout.flush()
+
+
+_validate_redis_configuration()
+print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}... {'(TLS)' if getattr(cfg, 'REDIS_TLS', False) else ''}")
+if getattr(cfg, "REDIS_URL", None):
+    print(f"[REDIS] Using REDIS_URL={cfg.REDIS_URL}")
+if getattr(cfg, "REDIS_TLS", False) and not getattr(cfg, "REDIS_URL", None):
+    print("[REDIS] TLS mode enabled via REDIS_TLS=true")
 sys.stdout.flush()
 try:
-    _redis = redis_lib.Redis(
-        host=cfg.REDIS_HOST,
-        port=cfg.REDIS_PORT,
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_timeout=5,
-        ssl=True,
-        ssl_cert_reqs=None,   # Skip cert verification for internal AWS endpoint
-    )
+    redis_kwargs = {
+        "host": cfg.REDIS_HOST,
+        "port": cfg.REDIS_PORT,
+        "decode_responses": True,
+        "socket_connect_timeout": 5,
+        "socket_timeout": 5,
+    }
+    if getattr(cfg, "REDIS_PASSWORD", None):
+        redis_kwargs["password"] = cfg.REDIS_PASSWORD
+    if getattr(cfg, "REDIS_TLS", False):
+        redis_kwargs["ssl"] = True
+
+    _redis = redis_lib.Redis(**redis_kwargs)
     _redis.ping()
     print("[REDIS] Connected OK.")
     sys.stdout.flush()
 except Exception as e:
-    print(f"[REDIS] FATAL: Cannot connect — {e}")
+    print("[REDIS] FATAL: Cannot connect to Redis. Verify REDIS_HOST/REDIS_PORT or REDIS_URL and ensure Redis is reachable from this container.")
+    print(f"[REDIS] Current config: REDIS_HOST={cfg.REDIS_HOST}, REDIS_PORT={cfg.REDIS_PORT}, REDIS_URL={getattr(cfg, 'REDIS_URL', None)}, REDIS_TLS={getattr(cfg, 'REDIS_TLS', False)}")
+    if isinstance(cfg.REDIS_HOST, str) and cfg.REDIS_HOST.endswith(".cache.amazonaws.com") and not getattr(cfg, "REDIS_TLS", False):
+        print("[REDIS] NOTE: AWS ElastiCache endpoints typically require TLS. Set REDIS_TLS=true or REDIS_URL=rediss://<host>:6379.")
+    print(f"[REDIS] Error: {type(e).__name__}: {e}")
+    if hasattr(e, "__cause__") and e.__cause__:
+        print(f"[REDIS] Cause: {type(e.__cause__).__name__}: {e.__cause__}")
     sys.stdout.flush()
     sys.exit(1)
 
@@ -135,11 +167,52 @@ _DEVICE_HZ_MAP = {
 }
 
 def _detect_device(json_data):
-    # Check deviceName first — NISO101/103/204 are PPG devices, never cuff.
-    # If deviceName is known, route directly regardless of any bp field in payload.
-    device_name = json_data.get("deviceName", "")
+    # Check nested device object first — future payloads may move device metadata under `device`.
+    device_block = json_data.get("device")
+    if isinstance(device_block, dict):
+        nested_name = device_block.get("deviceName")
+        if isinstance(nested_name, str):
+            nested_name = nested_name.strip()
+            if nested_name in _DEVICE_INPUT_MAP:
+                return _DEVICE_INPUT_MAP[nested_name]
+            if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+                return nested_name
+
+        nested_type = device_block.get("deviceType")
+        if isinstance(nested_type, str):
+            nested_type = nested_type.strip()
+            if nested_type in _DEVICE_INPUT_MAP:
+                return _DEVICE_INPUT_MAP[nested_type]
+            if nested_type in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+                return nested_type
+    elif isinstance(device_block, str):
+        nested_name = device_block.strip()
+        if nested_name in _DEVICE_INPUT_MAP:
+            return _DEVICE_INPUT_MAP[nested_name]
+        if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+            return nested_name
+
+    # Legacy support: top-level deviceName and deviceType remain valid.
+    device_name = json_data.get("deviceName")
+    if isinstance(device_name, str):
+        device_name = device_name.strip()
+    else:
+        device_name = ""
     if device_name in _DEVICE_INPUT_MAP:
         return _DEVICE_INPUT_MAP[device_name]
+    if device_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+        return device_name
+
+    device_type = json_data.get("deviceType")
+    if isinstance(device_type, str):
+        device_type = device_type.strip()
+    else:
+        device_type = ""
+    if device_type in _DEVICE_INPUT_MAP:
+        return _DEVICE_INPUT_MAP[device_type]
+    if device_type in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+        return device_type
+
     # No recognised deviceName — fall back to bp field presence (LS06 cuff)
     if "bp" in json_data:
         return DEVICE_LS06
@@ -157,14 +230,14 @@ def _preprocess_signal(raw_pleth, source_hz, target_hz, device_type):
 
     # 1. BERRYMED (NISO 101)
     if device_type == DEVICE_BERRYMED:
-        filtered = PROCESSORS["BERRYMED"].process(raw_pleth)
-        # Normalize to 0-1 to match CHECKME and NISO204 output scale
-        filtered_arr = np.array(filtered, dtype=float)
-        p2, p98 = np.percentile(filtered_arr, [2, 98])
+        from scipy.signal import medfilt as _medfilt
+        raw_arr  = np.array(raw_pleth, dtype=float)
+        despiked = _medfilt(raw_arr, kernel_size=5)
+        p2, p98  = np.percentile(despiked, [2, 98])
         if p98 - p2 > 1e-6:
-            clean_signal = np.clip((filtered_arr - p2) / (p98 - p2), 0, 1)
+            clean_signal = np.clip((despiked - p2) / (p98 - p2), 0, 1)
         else:
-            clean_signal = filtered_arr
+            clean_signal = despiked
         
     # 2. CHECKME (NISO 103)
     elif device_type == DEVICE_CHECKME:
@@ -183,7 +256,8 @@ def _preprocess_signal(raw_pleth, source_hz, target_hz, device_type):
     # FINAL STEP FOR ALL DEVICES: Resample to exact target_hz (120 Hz)
     if source_hz != target_hz and len(clean_signal) > 0:
         target_length = int(len(clean_signal) * (target_hz / source_hz))
-        return list(signal.resample(clean_signal, target_length)), sqi_info
+        resampled = signal.resample(np.array(clean_signal, dtype=float), target_length)
+        return list(resampled), sqi_info
         
     return list(clean_signal), sqi_info
 
@@ -229,6 +303,25 @@ def _apply_bp_offset(sbp, dbp):
             int(round(float(np.clip(dbp + offset_d, *cfg.BP_DBP_LIMITS)))))
 
 
+def _blend_with_reference(sbp, dbp, ref_sbp, ref_dbp):
+    if not (ref_sbp > 0 or ref_dbp > 0):
+        return int(round(float(sbp))), int(round(float(dbp)))
+
+    sbp_float = float(sbp)
+    dbp_float = float(dbp)
+    ref_sbp_float = float(ref_sbp)
+    ref_dbp_float = float(ref_dbp)
+
+    sbp_gap = abs(sbp_float - ref_sbp_float)
+    dbp_gap = abs(dbp_float - ref_dbp_float)
+    blend_weight = 0.50 if (sbp_gap >= 15 or dbp_gap >= 10) else 0.35
+
+    cal_sbp = int(round((1.0 - blend_weight) * sbp_float + blend_weight * ref_sbp_float))
+    cal_dbp = int(round((1.0 - blend_weight) * dbp_float + blend_weight * ref_dbp_float))
+    return (int(np.clip(cal_sbp, *cfg.BP_SBP_LIMITS)),
+            int(np.clip(cal_dbp, *cfg.BP_DBP_LIMITS)))
+
+
 def _compute_trends(session):
     """Returns (trending, morphology_change) from delta history and AIx history."""
     trending   = False
@@ -260,7 +353,7 @@ def process_vitals(json_data):
     device_type = _detect_device(json_data)
 
     # --- PATHWAY 1: THE BP CUFF (Update Reference Storage) ---
-    if device_type == DEVICE_LS06 or "bp" in json_data:
+    if device_type == DEVICE_LS06:
         bp_block = json_data.get("bp", {}) or json_data
         sys_val    = int(bp_block.get("BPSYS",  bp_block.get("bpSystolic",  bp_block.get("BPSystolic",  0))))
         dia_val    = int(bp_block.get("BPDIA",  bp_block.get("bpDiastolic", bp_block.get("BPDiastolic", 0))))
@@ -436,25 +529,32 @@ def process_vitals(json_data):
         # AIx from this packet
         aix = _compute_aix(model_ready_pleth, fs=120)
 
-        # Two-path BP correction
+        # Cross-category correction: if ref category differs from model category,
+        # re-root the AI's delta onto the reference category base
         ref_s = patient_ref.get("sbp", 0)
         ref_d = patient_ref.get("dbp", 0)
-        if bp_valid:
-            if ref_s > 0 and ref_d > 0:
-                if ref_s < 90 or ref_d < 60:
-                    ref_cat = "hypo"
-                elif ref_s > 130 or ref_d > 80:
-                    ref_cat = "hyper"
-                else:
-                    ref_cat = "normal"
-                if model_cat_raw != ref_cat:
-                    r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
-                    sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
-                    dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))
+        ai_sbp_raw = sbp_pred
+        ai_dbp_raw = dbp_pred
+        if bp_valid and ref_s > 0 and ref_d > 0:
+            if ref_s < 90 or ref_d < 60:
+                ref_cat = "hypo"
+            elif ref_s > 140 or ref_d > 90:
+                ref_cat = "hyper"
             else:
-                sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
+                ref_cat = "normal"
+            if model_cat_raw != ref_cat:
+                r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
+                sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
+                dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))
 
-        print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
+        raw_sbp_pred = sbp_pred
+        raw_dbp_pred = dbp_pred
+        if ref_s > 0 and ref_d > 0:
+            sbp_pred, dbp_pred = _blend_with_reference(raw_sbp_pred, raw_dbp_pred, ref_s, ref_d)
+        # elif bp_valid and not (ref_s > 0 and ref_d > 0):
+        #     sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
+        # NOTE: Empirical bias offset disabled — causes artificial inflation (up to +25 SBP / +15 DBP)
+        #       when no reference is set. Raw AI output is used directly instead.
 
         # 5. INITIALIZE SESSION STATE
         now = time.time()
@@ -475,7 +575,7 @@ def process_vitals(json_data):
                 "aix_history": [],
             }
 
-        # 6. SMART CALIBRATION: first packet per device → immediate check, rest → 15-min window
+        # 6. SESSION FLAGS
         has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0
         is_immediate  = has_reference and session["is_first_reading"].get(device_type, True)
 
@@ -488,29 +588,31 @@ def process_vitals(json_data):
                 "deviceType": "BP_SPO2",
                 "timestamp": int(now),
                 "sqi": sqi_info,
-                "message": "Poor signal on first packet. Waiting for clean signal before calibration check."
+                "message": "Poor signal on first packet. Waiting for clean signal."
             }
 
-        if is_immediate:
+        print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
+        sys.stdout.flush()
+
+        # First reading check — identical logic to test_pipeline
+        if is_immediate and bp_valid:
             ref_sbp = patient_ref.get("sbp", 0)
             ref_dbp = patient_ref.get("dbp", 0)
-
             if ref_sbp > 0 or ref_dbp > 0:
-                sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - sbp_pred) >= 15)
-                dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - dbp_pred) >= 15)
+                # Has reference: compare raw AI output vs cuff reading
+                sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - raw_sbp_pred) >= 15)
+                dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - raw_dbp_pred) >= 10)
+                alert_msg = f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={raw_sbp_pred}/{raw_dbp_pred}."
             else:
-                sbp_mismatch = (sbp_pred > 140 or sbp_pred < 90)
-                dbp_mismatch = (dbp_pred > 90  or dbp_pred < 60)
+                # No reference: physiological range check
+                sbp_mismatch = (raw_sbp_pred > 140 or raw_sbp_pred < 90)
+                dbp_mismatch = (raw_dbp_pred > 90  or raw_dbp_pred < 60)
+                alert_msg = f"Physiological Alert: AI={raw_sbp_pred}/{raw_dbp_pred} outside normal range."
 
             if sbp_mismatch or dbp_mismatch:
                 session["needs_recalibration"] = True
                 session["is_first_reading"][device_type] = False
                 _recal_write(adm_id, True)
-                alert_msg = (
-                    f"Physiological Alert: AI={sbp_pred}/{dbp_pred} outside normal range."
-                    if ref_sbp == 0 and ref_dbp == 0
-                    else f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={sbp_pred}/{dbp_pred}."
-                )
                 alert_payload = {**_meta,
                     "status": "alert",
                     "admissionId": adm_id,
@@ -536,7 +638,7 @@ def process_vitals(json_data):
                 _session_write(adm_id, session)
                 return alert_payload
 
-        # First reading matched — subsequent packets from this device go to the window
+        # First reading done — subsequent packets from this device go to the window
         if is_immediate:
             session["is_first_reading"][device_type] = False
 

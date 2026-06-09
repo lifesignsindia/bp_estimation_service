@@ -65,7 +65,29 @@ _DEVICE_NAME_MAP = {
 }
 
 # ─── Redis ────────────────────────────────────────────────────────────────────
-print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}...")
+
+def _validate_redis_configuration():
+    cloud_redis = isinstance(cfg.REDIS_HOST, str) and (
+        cfg.REDIS_HOST.endswith(".cache.amazonaws.com") or
+        cfg.REDIS_HOST.endswith(".redis.cache.windows.net") or
+        cfg.REDIS_HOST.endswith(".redis.cache.azure.com")
+    )
+    if not getattr(cfg, "REDIS_URL", None):
+        if cfg.REDIS_HOST in {"localhost", "127.0.0.1"}:
+            print("[REDIS] WARNING: REDIS_HOST is set to localhost. In container deployment, set REDIS_HOST=redis or REDIS_URL=redis://redis:6379.")
+            print("[REDIS] If Redis is external, configure REDIS_HOST/REDIS_PORT or REDIS_URL correctly.")
+            sys.stdout.flush()
+        elif cloud_redis and not getattr(cfg, "REDIS_TLS", False):
+            print("[REDIS] WARNING: Cloud Redis host detected but REDIS_TLS=false. If this is AWS ElastiCache or another managed service, use REDIS_TLS=true or REDIS_URL=rediss://<host>:6379.")
+            sys.stdout.flush()
+
+
+_validate_redis_configuration()
+print(f"[REDIS] Connecting to {cfg.REDIS_HOST}:{cfg.REDIS_PORT}... {'(TLS)' if getattr(cfg, 'REDIS_TLS', False) else ''}")
+if getattr(cfg, "REDIS_URL", None):
+    print(f"[REDIS] Using REDIS_URL={cfg.REDIS_URL}")
+if getattr(cfg, "REDIS_TLS", False) and not getattr(cfg, "REDIS_URL", None):
+    print("[REDIS] TLS mode enabled via REDIS_TLS=true")
 sys.stdout.flush()
 try:
     redis_kwargs = {
@@ -75,16 +97,23 @@ try:
         "socket_connect_timeout": 5,
         "socket_timeout": 5,
     }
-    if getattr(cfg, "REDIS_SSL", False):
+    if getattr(cfg, "REDIS_PASSWORD", None):
+        redis_kwargs["password"] = cfg.REDIS_PASSWORD
+    if getattr(cfg, "REDIS_TLS", False):
         redis_kwargs["ssl"] = True
-        redis_kwargs["ssl_cert_reqs"] = None
 
     _redis = redis_lib.Redis(**redis_kwargs)
     _redis.ping()
     print("[REDIS] Connected OK.")
     sys.stdout.flush()
 except Exception as e:
-    print(f"[REDIS] FATAL: Cannot connect — {e}")
+    print("[REDIS] FATAL: Cannot connect to Redis. Verify REDIS_HOST/REDIS_PORT or REDIS_URL and ensure Redis is reachable from this container.")
+    print(f"[REDIS] Current config: REDIS_HOST={cfg.REDIS_HOST}, REDIS_PORT={cfg.REDIS_PORT}, REDIS_URL={getattr(cfg, 'REDIS_URL', None)}, REDIS_TLS={getattr(cfg, 'REDIS_TLS', False)}")
+    if isinstance(cfg.REDIS_HOST, str) and cfg.REDIS_HOST.endswith(".cache.amazonaws.com") and not getattr(cfg, "REDIS_TLS", False):
+        print("[REDIS] NOTE: AWS ElastiCache endpoints typically require TLS. Set REDIS_TLS=true or REDIS_URL=rediss://<host>:6379.")
+    print(f"[REDIS] Error: {type(e).__name__}: {e}")
+    if hasattr(e, "__cause__") and e.__cause__:
+        print(f"[REDIS] Cause: {type(e.__cause__).__name__}: {e.__cause__}")
     sys.stdout.flush()
     sys.exit(1)
 
@@ -138,8 +167,32 @@ _DEVICE_HZ_MAP = {
 }
 
 def _detect_device(json_data):
-    # Check deviceName first — NISO101/103/204 are PPG devices, never cuff.
-    # If deviceName is known, route directly regardless of any bp field in payload.
+    # Check nested device object first — future payloads may move device metadata under `device`.
+    device_block = json_data.get("device")
+    if isinstance(device_block, dict):
+        nested_name = device_block.get("deviceName")
+        if isinstance(nested_name, str):
+            nested_name = nested_name.strip()
+            if nested_name in _DEVICE_INPUT_MAP:
+                return _DEVICE_INPUT_MAP[nested_name]
+            if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+                return nested_name
+
+        nested_type = device_block.get("deviceType")
+        if isinstance(nested_type, str):
+            nested_type = nested_type.strip()
+            if nested_type in _DEVICE_INPUT_MAP:
+                return _DEVICE_INPUT_MAP[nested_type]
+            if nested_type in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+                return nested_type
+    elif isinstance(device_block, str):
+        nested_name = device_block.strip()
+        if nested_name in _DEVICE_INPUT_MAP:
+            return _DEVICE_INPUT_MAP[nested_name]
+        if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+            return nested_name
+
+    # Legacy support: top-level deviceName and deviceType remain valid.
     device_name = json_data.get("deviceName")
     if isinstance(device_name, str):
         device_name = device_name.strip()
@@ -147,8 +200,9 @@ def _detect_device(json_data):
         device_name = ""
     if device_name in _DEVICE_INPUT_MAP:
         return _DEVICE_INPUT_MAP[device_name]
+    if device_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+        return device_name
 
-    # Some payloads omit deviceName but still carry deviceType or nested device metadata.
     device_type = json_data.get("deviceType")
     if isinstance(device_type, str):
         device_type = device_type.strip()
@@ -158,22 +212,6 @@ def _detect_device(json_data):
         return _DEVICE_INPUT_MAP[device_type]
     if device_type in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
         return device_type
-
-    device_block = json_data.get("device")
-    if isinstance(device_block, dict):
-        nested_name = device_block.get("deviceType")
-        if isinstance(nested_name, str):
-            nested_name = nested_name.strip()
-            if nested_name in _DEVICE_INPUT_MAP:
-                return _DEVICE_INPUT_MAP[nested_name]
-            if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
-                return nested_name
-    elif isinstance(device_block, str):
-        nested_name = device_block.strip()
-        if nested_name in _DEVICE_INPUT_MAP:
-            return _DEVICE_INPUT_MAP[nested_name]
-        if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
-            return nested_name
 
     # No recognised deviceName — fall back to bp field presence (LS06 cuff)
     if "bp" in json_data:

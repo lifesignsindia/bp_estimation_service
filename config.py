@@ -3,6 +3,7 @@ config.py - Central configuration for the Vitals Inference Pipeline.
 """
 
 import os
+import urllib.parse
 
 # ─── Processor Settings ──────────────────────────────────────────────────────
 class SETTINGS:
@@ -75,8 +76,40 @@ HB_GLU_MODEL_CONFIG = {
 # ─── Redis — Reference BP Persistence ────────────────────────────────────────
 REDIS_HOST     = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT     = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_SSL      = os.getenv("REDIS_SSL", "false").lower() == "true"
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+REDIS_URL      = os.getenv("REDIS_URL", None)
+REDIS_TLS_ENV  = os.getenv("REDIS_TLS")
 REDIS_REF_TTL  = 86400  # 24 hours per clinical session
+
+
+def _is_cloud_redis(hostname):
+    if not isinstance(hostname, str):
+        return False
+    return any(
+        hostname.endswith(suffix)
+        for suffix in (
+            ".cache.amazonaws.com",
+            ".redis.cache.windows.net",
+            ".redis.cache.azure.com",
+        )
+    )
+
+if REDIS_URL:
+    parsed = urllib.parse.urlparse(REDIS_URL)
+    if parsed.scheme in ("redis", "rediss"):
+        REDIS_HOST = parsed.hostname or REDIS_HOST
+        REDIS_PORT = int(parsed.port or REDIS_PORT)
+        REDIS_PASSWORD = parsed.password or REDIS_PASSWORD
+        REDIS_TLS = parsed.scheme == "rediss"
+    else:
+        REDIS_TLS = False
+else:
+    if _is_cloud_redis(REDIS_HOST):
+        REDIS_TLS = True
+    elif REDIS_TLS_ENV is None:
+        REDIS_TLS = False
+    else:
+        REDIS_TLS = REDIS_TLS_ENV.lower() in ("1", "true", "yes", "on")
 
 # ─── Kafka ────────────────────────────────────────────────────────────────────
 KAFKA_BROKERS      = os.getenv("KAFKA_BROKERS",      "localhost:9092")

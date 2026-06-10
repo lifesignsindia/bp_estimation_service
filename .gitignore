@@ -28,3 +28,7 @@ sample_ref.json
 new.json
 test_local.py
 docs/KAFKA_BACKEND_IMPLEMENTATION.md
+test_dashboard_pipeline.py
+test_extraction.py
+test_processor.py
+test.json

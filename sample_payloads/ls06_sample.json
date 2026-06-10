@@ -1,16 +1,8 @@
 {
-    "admissionId": "PAT001",
-    "patientId": "PAT001",
-    "patientName": "Test Patient",
-    "assignedDoctor": "Dr. Test",
-    "facilityId": "FAC01",
-    "deviceId": "SIM-LEPU-05:16",
-    "epochTime": 1755147524,
-    "seqNum": 1,
-    "seqPart": 1,
-    "bp": {
-        "BPSYS": 120,
-        "BPDIA": 80,
-        "BP_ERROR": 0
-    }
+  "admissionId": "PAT001",
+  "bp": {
+    "BPSYS": 125,
+    "BPDIA": 82,
+    "BP_ERROR": 0
+  }
 }

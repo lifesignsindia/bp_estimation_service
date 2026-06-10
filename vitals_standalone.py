@@ -167,7 +167,7 @@ _DEVICE_HZ_MAP = {
 }
 
 def _detect_device(json_data):
-    # Check nested device object first — future payloads may move device metadata under `device`.
+    # Only check nested device object — device.deviceName is the source of truth
     device_block = json_data.get("device")
     if isinstance(device_block, dict):
         nested_name = device_block.get("deviceName")
@@ -191,27 +191,6 @@ def _detect_device(json_data):
             return _DEVICE_INPUT_MAP[nested_name]
         if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
             return nested_name
-
-    # Legacy support: top-level deviceName and deviceType remain valid.
-    device_name = json_data.get("deviceName")
-    if isinstance(device_name, str):
-        device_name = device_name.strip()
-    else:
-        device_name = ""
-    if device_name in _DEVICE_INPUT_MAP:
-        return _DEVICE_INPUT_MAP[device_name]
-    if device_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
-        return device_name
-
-    device_type = json_data.get("deviceType")
-    if isinstance(device_type, str):
-        device_type = device_type.strip()
-    else:
-        device_type = ""
-    if device_type in _DEVICE_INPUT_MAP:
-        return _DEVICE_INPUT_MAP[device_type]
-    if device_type in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
-        return device_type
 
     # No recognised deviceName — fall back to bp field presence (LS06 cuff)
     if "bp" in json_data:
@@ -442,7 +421,8 @@ def process_vitals(json_data):
                 "message": f"Unknown deviceName: {json_data.get('deviceName')}. Expected NISO101/NISO103/NISO204."}
 
     actual_hz = _DEVICE_HZ_MAP.get(device_type, 120)
-    raw_pleth = json_data.get("pleth", {}).get("PLETH", [])
+    pleth_obj = json_data.get("pleth", {})
+    raw_pleth = pleth_obj.get("plethWave", []) or pleth_obj.get("PLETH", [])
 
     # 1. Clean and enforce 120Hz
     model_ready_pleth, sqi_info = _preprocess_signal(raw_pleth, actual_hz, 120, device_type)

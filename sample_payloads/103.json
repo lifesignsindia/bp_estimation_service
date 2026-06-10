@@ -1,27 +1,26 @@
 {
-    "admissionId": "PAT002",
-    "patientId": "PAT002",
-    "patientName": "Test Patient 2",
-    "assignedDoctor": "Dr. Test",
-    "facilityId": "FAC01",
-    "deviceId": "CHECKME_DEV_001",
+  "admissionId": "PAT002",
+  "patientId": "PAT002",
+  "patientName": "CheckMe Test Patient",
+  "assignedDoctor": "Dr. Test",
+  "facilityId": "FAC02",
+  "deviceId": "CM456XYZ",
+  "epochTime": 1777961932,
+  "seqNum": 1,
+  "seqPart": 1,
+  "spo2": 97,
+  "cgroup": "GENERAL",
+  "pgroup": "GENERAL",
+  "Age": 42,
+  "Gender": "Female",
+  "BMI": 25.1,
+  "device": {
     "deviceName": "NISO103",
-    "epochTime": 1777961931,
-    "seqNum": 2,
-    "seqPart": 1,
-    "spo2": 98,
-    "device": "NISO103",
-    "cgroup": "GENERAL",
-    "pgroup": "GENERAL",
-    "Age": 40,
-    "Gender": "Female",
-    "BMI": 22.5,
-    "pleth": {
-        "PLETH": [
-            131, 132, 133, 156, 156, 156, 134, 135,
-            138, 142, 148, 155, 161, 165, 167, 166,
-            163, 158, 151, 143, 136, 130, 126, 124,
-            123, 124, 127, 131, 136, 141
-        ]
-    }
+    "deviceType": "BP_SPO2",
+    "macAddress": "B5:D2:49:4B:8F:3C",
+    "batteryLevel": 78
+  },
+  "pleth": {
+    "plethWave": [500, 515, 540, 575, 605, 625, 635, 630, 615, 590, 560, 525, 490, 460, 435, 420, 415, 420, 435, 460, 490, 520, 545, 560, 565, 560, 545, 520, 490, 460, 440, 430, 430, 440, 455, 480, 510, 540, 560, 570, 570, 560, 540, 515, 490, 465, 445, 435, 435, 445, 460, 480, 500, 520, 535, 545, 545, 540, 530, 515, 500, 485, 475, 470, 475, 485, 500, 515, 530, 540, 545, 545, 540, 530, 515, 500, 485, 475, 470, 475, 485, 500, 515, 530, 540, 545, 545, 540, 530, 515, 500, 485, 475, 470, 475, 485, 500, 515, 530, 540, 545, 545, 540, 530, 515, 500, 485, 475, 470, 475, 485, 500, 515, 530, 540, 545, 545, 540, 530, 515, 500, 485, 475, 470]
+  }
 }

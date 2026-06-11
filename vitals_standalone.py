@@ -135,6 +135,13 @@ def _recal_read(adm_id):
     raw = _redis.get(f"recal:{adm_id}")
     return raw == "1" if raw else False
 
+def _primary_write(adm_id, device_type):
+    _redis.setex(f"primary:{adm_id}", cfg.REDIS_REF_TTL, device_type)
+
+def _primary_read(adm_id):
+    raw = _redis.get(f"primary:{adm_id}")
+    return raw if raw else None
+
 # ─── Session helpers (Redis-backed, survives restarts & works across pods) ────
 SESSION_TTL = 7200  # 2 hours — longer than any possible 15-min session
 
@@ -169,6 +176,18 @@ _DEVICE_HZ_MAP = {
 def _detect_device(json_data):
     # Only check nested device object — device.deviceName is the source of truth
     device_block = json_data.get("device")
+
+    # NISO206 is a reference-only device: it sends cuff-style BP (bp.BPSYS/BPDIA) and no
+    # pleth. Route it to the reference pathway (PATHWAY 1) so it updates the reference BP
+    # with the existing 15-minute cooldown — never used for pleth/BP estimation.
+    _dn = None
+    if isinstance(device_block, dict):
+        _dn = device_block.get("deviceName") or device_block.get("deviceType")
+    elif isinstance(device_block, str):
+        _dn = device_block
+    if isinstance(_dn, str) and _dn.strip() == "NISO206":
+        return DEVICE_LS06
+
     if isinstance(device_block, dict):
         nested_name = device_block.get("deviceName")
         if isinstance(nested_name, str):
@@ -420,9 +439,39 @@ def process_vitals(json_data):
         return {**_meta, "status": "error", "admissionId": adm_id,
                 "message": f"Unknown deviceName: {json_data.get('deviceName')}. Expected NISO101/NISO103/NISO204."}
 
+    # --- PRIMARY DEVICE LOCK (NISO101 preferred) ---
+    # NISO101 (BERRYMED) is always the main BP-estimation device: whenever a 101 packet
+    # arrives it claims/takes over the primary slot. Any other PPG device (204/103) is used
+    # for estimation only when 101 does NOT own the admission, so 204 readings never mix
+    # into a 101 admission's 15-minute average. Once 101 owns the admission there is no
+    # handover back to another device (the lock persists even if 101 goes silent). The
+    # normal 1800-sample minimum still applies to whichever device is primary.
+    _primary = _primary_read(adm_id)
+    if device_type == DEVICE_BERRYMED:
+        if _primary != DEVICE_BERRYMED:
+            _primary_write(adm_id, DEVICE_BERRYMED)
+        _primary = DEVICE_BERRYMED
+    elif _primary is None:
+        _primary_write(adm_id, device_type)
+        _primary = device_type
+    elif _primary != device_type:
+        print(f"[LOCK] adm={adm_id} | device={device_type} ignored | admission locked to primary={_primary}")
+        sys.stdout.flush()
+        return {**_meta, "status": "ignored", "admissionId": adm_id,
+                "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
+                "deviceType": "BP_SPO2",
+                "message": f"Device {_DEVICE_NAME_MAP.get(device_type, device_type)} ignored. "
+                           f"Admission locked to primary device {_DEVICE_NAME_MAP.get(_primary, _primary)}."}
+
     actual_hz = _DEVICE_HZ_MAP.get(device_type, 120)
-    pleth_obj = json_data.get("pleth", {})
-    raw_pleth = pleth_obj.get("plethWave", []) or pleth_obj.get("PLETH", [])
+    pleth_obj = json_data.get("pleth", {}) or {}
+    raw_pleth = (
+        pleth_obj.get("plethWave")
+        or pleth_obj.get("PLETH")
+        or pleth_obj.get("plethwave")
+        or pleth_obj.get("pleth_wave")
+        or []
+    )
 
     # 1. Clean and enforce 120Hz
     model_ready_pleth, sqi_info = _preprocess_signal(raw_pleth, actual_hz, 120, device_type)
@@ -545,7 +594,9 @@ def process_vitals(json_data):
             session = {
                 "start_time": now,
                 "readings": [],
+                "raw_readings": [],
                 "is_first_reading": {},
+                "last_packet_time": {},
                 "needs_recalibration": _needs_recal,
                 "current_interval": 1200 if _needs_recal else 900,
                 "last_confirmation_time": 0,
@@ -554,6 +605,20 @@ def process_vitals(json_data):
                 "aix_values": [],
                 "aix_history": [],
             }
+
+        # --- GAP RE-ARM ---
+        # If this device has been silent for >= 10 minutes, treat the reconnect as a fresh
+        # first reading: clear the stale window and re-compare the recent packet against the
+        # stored reference instead of averaging it into hours-old data.
+        _last_pkt = session.setdefault("last_packet_time", {}).get(device_type, 0)
+        if _last_pkt > 0 and (now - _last_pkt) >= 600:
+            print(f"[GAP] adm={adm_id} | {device_type} | gap={int(now - _last_pkt)}s >= 600s -> re-arming first-reading check")
+            sys.stdout.flush()
+            session["is_first_reading"][device_type] = True
+            session["readings"] = []
+            session["raw_readings"] = []
+            session["start_time"] = now
+        session["last_packet_time"][device_type] = now
 
         # 6. SESSION FLAGS
         has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0
@@ -571,8 +636,9 @@ def process_vitals(json_data):
                 "message": "Poor signal on first packet. Waiting for clean signal."
             }
 
-        print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
-        sys.stdout.flush()
+        if bp_valid:
+            print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
+            sys.stdout.flush()
 
         # First reading check — identical logic to test_pipeline
         if is_immediate and bp_valid:
@@ -593,6 +659,8 @@ def process_vitals(json_data):
                 session["needs_recalibration"] = True
                 session["is_first_reading"][device_type] = False
                 _recal_write(adm_id, True)
+                print(f"[ALERT] adm={adm_id} | raw_AI={raw_sbp_pred}/{raw_dbp_pred} | ref={ref_sbp}/{ref_dbp} | {alert_msg}")
+                sys.stdout.flush()
                 alert_payload = {**_meta,
                     "status": "alert",
                     "admissionId": adm_id,
@@ -624,6 +692,7 @@ def process_vitals(json_data):
 
         # 7. OUTPUT LOGIC (15-min window accumulation)
         if bp_valid:
+            session.setdefault("raw_readings", []).append((raw_sbp_pred, raw_dbp_pred, hb_pred, glu_pred))
             session["readings"].append((sbp_pred, dbp_pred, hb_pred, glu_pred))
             if pkt_delta_s is not None:
                 session["deltas"].append((pkt_delta_s, pkt_delta_d))
@@ -692,9 +761,10 @@ def process_vitals(json_data):
             )
         session["deltas"] = []
 
+        raw_readings = session.get("raw_readings", [])
         readings = session["readings"]
 
-        if not readings:
+        if not raw_readings and not readings:
             session["start_time"] = now
             _session_write(adm_id, session)
             return {**_meta,
@@ -708,8 +778,10 @@ def process_vitals(json_data):
                 "message": "No valid signal in window. All packets had poor signal quality."
             }
 
-        avg_sbp = int(np.mean([r[0] for r in readings]))
-        avg_dbp = int(np.mean([r[1] for r in readings]))
+        raw_avg_sbp = int(np.mean([r[0] for r in raw_readings])) if raw_readings else int(np.mean([r[0] for r in readings]))
+        raw_avg_dbp = int(np.mean([r[1] for r in raw_readings])) if raw_readings else int(np.mean([r[1] for r in readings]))
+        avg_sbp = int(np.mean([r[0] for r in readings])) if readings else raw_avg_sbp
+        avg_dbp = int(np.mean([r[1] for r in readings])) if readings else raw_avg_dbp
 
         if not has_reference and aix_vals and window_deltas:
             mean_aix     = float(np.mean(aix_vals))
@@ -732,17 +804,22 @@ def process_vitals(json_data):
         final_msg = "Immediate initial reading confirmed." if is_immediate else "15-minute averaged clinical payload."
         
         if ref_sbp > 0 or ref_dbp > 0:
-            sbp_avg_mismatch = (ref_sbp > 0 and abs(ref_sbp - avg_sbp) >= 15)
-            dbp_avg_mismatch = (ref_dbp > 0 and abs(ref_dbp - avg_dbp) >= 15)
+            # Blend the RAW average toward reference for the display value, but run the
+            # mismatch check on the RAW average so real deviations are not masked by blending.
+            avg_sbp, avg_dbp = _blend_with_reference(raw_avg_sbp, raw_avg_dbp, ref_sbp, ref_dbp)
+            sbp_avg_mismatch = (ref_sbp > 0 and abs(ref_sbp - raw_avg_sbp) >= 15)
+            dbp_avg_mismatch = (ref_dbp > 0 and abs(ref_dbp - raw_avg_dbp) >= 15)
         else:
             sbp_avg_mismatch = (avg_sbp > 140 or avg_sbp < 90)
             dbp_avg_mismatch = (avg_dbp > 90  or avg_dbp < 60)
-        
+
         if sbp_avg_mismatch or dbp_avg_mismatch:
             final_status = "alert"
-            final_msg = f"Averaged Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI_Avg={avg_sbp}/{avg_dbp}."
+            final_msg = f"Averaged Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, Raw_AI_Avg={raw_avg_sbp}/{raw_avg_dbp}, Display={avg_sbp}/{avg_dbp}."
             session["needs_recalibration"] = True
             _recal_write(adm_id, True)
+            print(f"[ALERT] adm={adm_id} | raw_AI_avg={raw_avg_sbp}/{raw_avg_dbp} | ref={ref_sbp}/{ref_dbp} | display={avg_sbp}/{avg_dbp}")
+            sys.stdout.flush()
         else:
             session["needs_recalibration"] = False
             _recal_write(adm_id, False)
@@ -760,6 +837,7 @@ def process_vitals(json_data):
 
         session["start_time"] = now
         session["readings"] = []
+        session["raw_readings"] = []
 
         # 8. Construct Final FORMAL JSON
         final_payload = {**_meta,
@@ -792,11 +870,10 @@ def process_vitals(json_data):
         _session_write(adm_id, session)
         return final_payload
     except Exception as e:
-        _err_session = _session_read(adm_id)
-        if _err_session is not None:
-            _err_session["readings"] = []
-            _err_session["start_time"] = time.time()
-            _session_write(adm_id, _err_session)
+        # Skip the bad packet but PRESERVE the accumulation window — one malformed packet
+        # must not discard minutes of already-collected valid readings.
+        print(f"[ERR] Packet processing failed for {adm_id}: {e} -- packet skipped, window preserved.")
+        sys.stdout.flush()
         return {"status": "error", "admissionId": adm_id, "message": f"AI Inference Failed: {str(e)}"}
 
 # ─────────────────────────────────────────────────────────────────────────────

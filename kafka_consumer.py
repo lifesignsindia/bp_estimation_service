@@ -93,6 +93,7 @@ def _debug(event, detail="", adm_id="-", status="-"):
         producer.poll(0)
     except Exception as e:
         print(f"[DBG] Publish failed: {e}")
+        sys.stdout.flush()
 
 
 def _shutdown(signum, frame):
@@ -151,8 +152,10 @@ def run():
             continue
 
         adm_id  = payload.get("admissionId", "UNKNOWN")
-        device  = payload.get("deviceName",  "UNKNOWN")
-        pleth_n = len(payload.get("pleth", {}).get("PLETH", []))
+        _dev_block = payload.get("device", {})
+        device  = (_dev_block.get("deviceName") if isinstance(_dev_block, dict) else _dev_block) or "UNKNOWN"
+        _pleth_block = payload.get("pleth", {}) or {}
+        pleth_n = len(_pleth_block.get("plethWave") or _pleth_block.get("PLETH") or [])
         print(f"[MSG] Parsed | admissionId={adm_id} | device={device} | pleth_samples={pleth_n}")
         sys.stdout.flush()
 
@@ -182,7 +185,7 @@ def run():
                 )
                 _flush_counter += 1
                 if _flush_counter >= _FLUSH_EVERY:
-                    producer.flush()
+                    producer.flush(timeout=5)
                     _flush_counter = 0
             except Exception as e:
                 print(f"[KAFKA] Produce error: {e}")
@@ -221,10 +224,14 @@ def run():
             sys.stdout.flush()
             _debug("UNKNOWN_STATUS", result.get("message", ""), adm_id, status)
 
-    producer.flush()
+    print("[KAFKA] Flushing pending messages...")
+    sys.stdout.flush()
+    producer.flush(timeout=10)
+    _debug("PIPELINE_STOPPED", "Graceful shutdown")
+    producer.flush(timeout=5)
     consumer.close()
     print("[KAFKA] Shutdown complete.")
-    _debug("PIPELINE_STOPPED", "Graceful shutdown")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

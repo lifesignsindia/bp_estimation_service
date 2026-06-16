@@ -294,9 +294,51 @@ def _compute_aix(ppg, fs=120):
 
 
 def _apply_bp_offset(sbp, dbp):
-    """Empirical bias correction for no-reference mode via smooth interpolation."""
-    offset_s = float(np.interp(sbp, [85.0, 100.0, 110.0], [25.0, 15.0, 0.0]))
-    offset_d = float(np.interp(dbp, [45.0, 60.0], [15.0, 0.0]))
+    """
+    Deterministic bias correction for NO-REFERENCE mode only.
+
+    Field testing showed the model systematically under-reads when no cuff
+    reference is set: true 120-130 patients land at ~90-100. Two explicit
+    correction cases on the SBP output, with DBP lifted in parallel:
+
+        SBP < 80             : hold +25 (avoid over-boosting genuine lows)
+        Case 1 — SBP 80-89   : lift +25..+20
+        Case 2 — SBP 90-100  : lift +20..+15  (joins Case 1 at the seam)
+        SBP > 100            : taper to 0 by ~120 (model already accurate)
+
+    The seam at SBP 90 is matched (+20) so the curve is monotonic — a higher
+    model SBP never produces a lower final reading.
+
+    Deterministic by design: the correction is a fixed function of the model
+    output, so the model's own beat-to-beat variation carries through (same
+    signal -> same number). No random jitter — a BP reading must be reproducible.
+
+    WARNING: this also lifts genuinely low readings, so it can mask real
+    hypotension. It is a TEMPORARY field-testing aid on the no-reference path
+    and must be removed once per-patient reference calibration is in place.
+    """
+    # --- SBP: two explicit under-read cases + a floor below 80 and a taper above 100 ---
+    if sbp < 80.0:
+        # Below 80 — hold the Case 1 lift (avoids over-boosting genuine lows)
+        offset_s = 25.0
+    elif sbp < 90.0:
+        # Case 1 — model SBP 80-89: lift +25..+20
+        offset_s = float(np.interp(sbp, [80.0, 89.0], [25.0, 20.0]))
+    elif sbp <= 100.0:
+        # Case 2 — model SBP 90-100: lift +20..+15 (joins Case 1 at the 89/90 seam)
+        offset_s = float(np.interp(sbp, [90.0, 100.0], [20.0, 15.0]))
+    else:
+        # Above 100 the model is already close — taper to 0 by ~120
+        offset_s = float(np.interp(sbp, [100.0, 120.0], [15.0, 0.0]))
+
+    # --- DBP: corrected in parallel with the SBP band, smaller magnitude ---
+    if dbp < 60.0:
+        offset_d = float(np.interp(dbp, [50.0, 59.0], [15.0, 12.0]))
+    elif dbp <= 70.0:
+        offset_d = float(np.interp(dbp, [60.0, 70.0], [12.0, 8.0]))
+    else:
+        offset_d = float(np.interp(dbp, [70.0, 80.0], [8.0, 0.0]))
+
     return (int(round(float(np.clip(sbp + offset_s, *cfg.BP_SBP_LIMITS)))),
             int(round(float(np.clip(dbp + offset_d, *cfg.BP_DBP_LIMITS)))))
 
@@ -580,10 +622,10 @@ def process_vitals(json_data):
         raw_dbp_pred = dbp_pred
         if ref_s > 0 and ref_d > 0:
             sbp_pred, dbp_pred = _blend_with_reference(raw_sbp_pred, raw_dbp_pred, ref_s, ref_d)
-        # elif bp_valid and not (ref_s > 0 and ref_d > 0):
-        #     sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
-        # NOTE: Empirical bias offset disabled — causes artificial inflation (up to +25 SBP / +15 DBP)
-        #       when no reference is set. Raw AI output is used directly instead.
+        elif bp_valid:
+            # NO-REFERENCE calibration — temporary field-testing aid. See _apply_bp_offset.
+            # raw_sbp_pred / raw_dbp_pred stay uncorrected for trend-delta tracking below.
+            sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
 
         # 5. INITIALIZE SESSION STATE
         now = time.time()
@@ -607,12 +649,12 @@ def process_vitals(json_data):
             }
 
         # --- GAP RE-ARM ---
-        # If this device has been silent for >= 10 minutes, treat the reconnect as a fresh
+        # If this device has been silent for >= 20 minutes, treat the reconnect as a fresh
         # first reading: clear the stale window and re-compare the recent packet against the
         # stored reference instead of averaging it into hours-old data.
         _last_pkt = session.setdefault("last_packet_time", {}).get(device_type, 0)
-        if _last_pkt > 0 and (now - _last_pkt) >= 600:
-            print(f"[GAP] adm={adm_id} | {device_type} | gap={int(now - _last_pkt)}s >= 600s -> re-arming first-reading check")
+        if _last_pkt > 0 and (now - _last_pkt) >= 1200:
+            print(f"[GAP] adm={adm_id} | {device_type} | gap={int(now - _last_pkt)}s >= 1200s -> re-arming first-reading check")
             sys.stdout.flush()
             session["is_first_reading"][device_type] = True
             session["readings"] = []
@@ -669,7 +711,6 @@ def process_vitals(json_data):
                     "timestamp": int(now),
                     "message": alert_msg,
                     "bp": {
-                        "bpSystolic": sbp_pred, "bpDiastolic": dbp_pred,
                         "estimated_sbp": sbp_pred, "estimated_dbp": dbp_pred,
                         "category": ai_results.get("category", "Unknown"),
                         "trend": ai_results.get("trend", {"trend": "Stable ->", "slope": 0.0, "readings": 0}),
@@ -726,8 +767,6 @@ def process_vitals(json_data):
                 "elapsed_seconds": int(elapsed),
                 "target_seconds": int(target_interval),
                 "bp": {
-                    "bpSystolic": sbp_pred,
-                    "bpDiastolic": dbp_pred,
                     "estimated_sbp": sbp_pred,
                     "estimated_dbp": dbp_pred,
                     "category": ai_results.get("category", "Unknown"),
@@ -848,8 +887,6 @@ def process_vitals(json_data):
             "timestamp": int(now),
             "reading_count": len(readings),
             "bp": {
-                "bpSystolic": avg_sbp,
-                "bpDiastolic": avg_dbp,
                 "estimated_sbp": avg_sbp,
                 "estimated_dbp": avg_dbp,
                 "category": ai_results.get("category", "Unknown"),

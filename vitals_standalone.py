@@ -711,7 +711,6 @@ def process_vitals(json_data):
                     "timestamp": int(now),
                     "message": alert_msg,
                     "bp": {
-                        "bpSystolic": sbp_pred, "bpDiastolic": dbp_pred,
                         "estimated_sbp": sbp_pred, "estimated_dbp": dbp_pred,
                         "category": ai_results.get("category", "Unknown"),
                         "trend": ai_results.get("trend", {"trend": "Stable ->", "slope": 0.0, "readings": 0}),
@@ -768,8 +767,6 @@ def process_vitals(json_data):
                 "elapsed_seconds": int(elapsed),
                 "target_seconds": int(target_interval),
                 "bp": {
-                    "bpSystolic": sbp_pred,
-                    "bpDiastolic": dbp_pred,
                     "estimated_sbp": sbp_pred,
                     "estimated_dbp": dbp_pred,
                     "category": ai_results.get("category", "Unknown"),
@@ -890,8 +887,6 @@ def process_vitals(json_data):
             "timestamp": int(now),
             "reading_count": len(readings),
             "bp": {
-                "bpSystolic": avg_sbp,
-                "bpDiastolic": avg_dbp,
                 "estimated_sbp": avg_sbp,
                 "estimated_dbp": avg_dbp,
                 "category": ai_results.get("category", "Unknown"),

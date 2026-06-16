@@ -191,15 +191,15 @@ def run():
                 print(f"[KAFKA] Produce error: {e}")
                 sys.stdout.flush()
             bp = result.get("bp", {})
-            print(f"[OUT] {status.upper()} | adm={adm_id} | BP={bp.get('bpSystolic','-')}/{bp.get('bpDiastolic','-')}")
+            print(f"[OUT] {status.upper()} | adm={adm_id} | EBP={bp.get('estimated_sbp','-')}/{bp.get('estimated_dbp','-')}")
             sys.stdout.flush()
-            _debug("OUTPUT_FORWARDED", f"BP={bp.get('bpSystolic','-')}/{bp.get('bpDiastolic','-')}", adm_id, status)
+            _debug("OUTPUT_FORWARDED", f"EBP={bp.get('estimated_sbp','-')}/{bp.get('estimated_dbp','-')}", adm_id, status)
 
         elif status == "accumulating":
             bp      = result.get("bp", {})
             elapsed = result.get("elapsed_seconds", "-")
             target  = result.get("target_seconds",  "-")
-            print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} | BP={bp.get('bpSystolic','-')}/{bp.get('bpDiastolic','-')}")
+            print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} | EBP={bp.get('estimated_sbp','-')}/{bp.get('estimated_dbp','-')}")
             sys.stdout.flush()
             _debug("ACCUMULATING", f"{elapsed}/{target}s", adm_id, status)
 

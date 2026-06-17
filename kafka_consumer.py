@@ -34,11 +34,13 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
-# TEMPORARY (ebp-dashboard field test): "accumulating" added so the intermediate
-# per-packet estimates are sent as output payloads (reaching the socket / dashboard),
-# not just printed to logs. This raises output volume substantially.
+# TEMPORARY (ebp-dashboard field test): forward the meaningful per-patient states
+# that normally only go to logs — "accumulating" (interim estimates), "poor_signal"
+# (flat/poor signal) and "error" — so the dashboard can mirror each patient's real
+# state, not just final BP. ("ignored" = device-lock/cooldown housekeeping is left out.)
+# This raises output volume substantially.
 # REVERT after testing → restore to {"success", "alert"}. Safe state: tag `working_pipeline`.
-FORWARD_STATUSES = {"success", "alert", "accumulating"}
+FORWARD_STATUSES = {"success", "alert", "accumulating", "poor_signal", "error"}
 
 consumer = Consumer({
     "bootstrap.servers":    cfg.KAFKA_BROKERS,

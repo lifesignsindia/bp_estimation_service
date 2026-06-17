@@ -34,7 +34,11 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
-FORWARD_STATUSES = {"success", "alert"}
+# TEMPORARY (ebp-dashboard field test): "accumulating" added so the intermediate
+# per-packet estimates are sent as output payloads (reaching the socket / dashboard),
+# not just printed to logs. This raises output volume substantially.
+# REVERT after testing → restore to {"success", "alert"}. Safe state: tag `working_pipeline`.
+FORWARD_STATUSES = {"success", "alert", "accumulating"}
 
 consumer = Consumer({
     "bootstrap.servers":    cfg.KAFKA_BROKERS,

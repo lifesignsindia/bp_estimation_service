@@ -32,3 +32,7 @@ test_dashboard_pipeline.py
 test_extraction.py
 test_processor.py
 test.json
+ebp_dashboard/app.py
+ebp_dashboard/templates/patient.html
+ebp_dashboard/templates/roster.html
+ebp_dashboard/

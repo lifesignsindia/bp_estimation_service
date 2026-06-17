@@ -620,12 +620,18 @@ def process_vitals(json_data):
 
         raw_sbp_pred = sbp_pred
         raw_dbp_pred = dbp_pred
+        # Calibration TARGET for this packet. With a reference, the value actually
+        # emitted is EASED toward this target after the session loads (see below),
+        # so a new/changed reference moves the output gradually, not in one jump.
         if ref_s > 0 and ref_d > 0:
-            sbp_pred, dbp_pred = _blend_with_reference(raw_sbp_pred, raw_dbp_pred, ref_s, ref_d)
+            cal_sbp, cal_dbp = _blend_with_reference(raw_sbp_pred, raw_dbp_pred, ref_s, ref_d)
         elif bp_valid:
             # NO-REFERENCE calibration — temporary field-testing aid. See _apply_bp_offset.
             # raw_sbp_pred / raw_dbp_pred stay uncorrected for trend-delta tracking below.
-            sbp_pred, dbp_pred = _apply_bp_offset(sbp_pred, dbp_pred)
+            cal_sbp, cal_dbp = _apply_bp_offset(sbp_pred, dbp_pred)
+        else:
+            cal_sbp, cal_dbp = sbp_pred, dbp_pred
+        sbp_pred, dbp_pred = cal_sbp, cal_dbp
 
         # 5. INITIALIZE SESSION STATE
         now = time.time()
@@ -660,7 +666,33 @@ def process_vitals(json_data):
             session["readings"] = []
             session["raw_readings"] = []
             session["start_time"] = now
+            session.pop("cal_offset_s", None)   # re-seed easing after a long gap
+            session.pop("cal_offset_d", None)
         session["last_packet_time"][device_type] = now
+
+        # --- CALIBRATION EASING (reference path only) ---
+        # The raw AI estimate passes straight through; only the reference-induced
+        # correction (cal_target - raw) is eased in via an EMA. So when a new or
+        # changed reference shifts the blend target, the emitted value moves toward
+        # it gradually over several readings instead of snapping — making it easy to
+        # see how the model converges, while real AI changes still show immediately.
+        # NOTE: the offset persists across windows; it is only re-seeded on a fresh
+        # session or a long gap. A new reference is NOT a reset — it eases.
+        if bp_valid and ref_s > 0 and ref_d > 0:
+            EASE_ALPHA = 0.25
+            target_off_s = cal_sbp - raw_sbp_pred
+            target_off_d = cal_dbp - raw_dbp_pred
+            prev_off_s = session.get("cal_offset_s")
+            prev_off_d = session.get("cal_offset_d")
+            if prev_off_s is None:          # first reading after a (re)set — seed, no ease
+                off_s, off_d = target_off_s, target_off_d
+            else:
+                off_s = prev_off_s + EASE_ALPHA * (target_off_s - prev_off_s)
+                off_d = prev_off_d + EASE_ALPHA * (target_off_d - prev_off_d)
+            session["cal_offset_s"] = off_s
+            session["cal_offset_d"] = off_d
+            sbp_pred = int(round(float(np.clip(raw_sbp_pred + off_s, *cfg.BP_SBP_LIMITS))))
+            dbp_pred = int(round(float(np.clip(raw_dbp_pred + off_d, *cfg.BP_DBP_LIMITS))))
 
         # 6. SESSION FLAGS
         has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0

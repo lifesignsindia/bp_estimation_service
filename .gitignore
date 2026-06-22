@@ -36,3 +36,8 @@ ebp_dashboard/app.py
 ebp_dashboard/templates/patient.html
 ebp_dashboard/templates/roster.html
 ebp_dashboard/
+saved_niso103_sample.json
+saved_good_niso103_sample.json
+inspect_other_dbs.py
+inspect_db.py
+debug_plot_payload.json

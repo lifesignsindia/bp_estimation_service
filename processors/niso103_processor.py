@@ -99,10 +99,14 @@ def compute_signal_quality(cleaned, filtered, fs=120):
         return 0.0, False, "FLAT_LINE", ac_amplitude
     
     # --- Check 2: ADC saturation (pressed too hard or sensor glitch) ---
-    # Raw cleaned values near 0 or 255 indicate ADC clipping
-    raw_max_pct = np.percentile(cleaned, 99.5)
-    raw_min_pct = np.percentile(cleaned, 0.5)
-    if raw_max_pct > 250 or raw_min_pct < 5:
+    # Real saturation = the signal is PINNED at a rail for a large share of samples.
+    # A healthy CHECKME PPG (0-168 range) dips near 0 on every beat, so a low trough
+    # value is NORMAL — flagging "< 5" rejected every good epoch. Instead require a
+    # big fraction of samples stuck at the extreme (genuine clipping).
+    cleaned_arr = np.asarray(cleaned, dtype=float)
+    frac_low  = float(np.mean(cleaned_arr <= 1))
+    frac_high = float(np.mean(cleaned_arr >= 250))
+    if frac_low > 0.20 or frac_high > 0.20:
         return 0.3, False, "SATURATED", ac_amplitude
     
     # --- Check 3: Baseline step detection ---

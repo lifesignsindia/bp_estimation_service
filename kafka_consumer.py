@@ -157,11 +157,36 @@ def run():
             _debug("DECODE_ERROR", str(e))
             continue
 
-        adm_id  = payload.get("admissionId", "UNKNOWN")
+        adm_id = payload.get("admissionId", "UNKNOWN")
+
+        # Support both nested and top-level device metadata. Some payloads expose
+        # deviceType inside the nested object instead of deviceName.
         _dev_block = payload.get("device", {})
-        device  = (_dev_block.get("deviceName") if isinstance(_dev_block, dict) else _dev_block) or "UNKNOWN"
+        if isinstance(_dev_block, dict):
+            device = (
+                _dev_block.get("deviceName")
+                or _dev_block.get("deviceType")
+                or payload.get("deviceName")
+                or payload.get("deviceType")
+                or payload.get("device")
+            )
+        else:
+            device = _dev_block or payload.get("deviceName") or payload.get("deviceType")
+
+        if isinstance(device, str):
+            device = device.strip() or "UNKNOWN"
+        else:
+            device = "UNKNOWN"
+
         _pleth_block = payload.get("pleth", {}) or {}
-        pleth_n = len(_pleth_block.get("plethWave") or _pleth_block.get("PLETH") or [])
+        pleth_values = (
+            _pleth_block.get("plethWave")
+            or _pleth_block.get("PLETH")
+            or _pleth_block.get("plethwave")
+            or _pleth_block.get("pleth_wave")
+            or []
+        )
+        pleth_n = len(pleth_values)
         print(f"[MSG] Parsed | admissionId={adm_id} | device={device} | pleth_samples={pleth_n}")
         sys.stdout.flush()
 

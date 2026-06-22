@@ -174,44 +174,51 @@ _DEVICE_HZ_MAP = {
 }
 
 def _detect_device(json_data):
-    # Only check nested device object — device.deviceName is the source of truth
+    """
+    Resolve the device type from either nested or top-level fields.
+
+    The payload format is not fully consistent across vendors, so we accept all of:
+      - device.deviceName
+      - device.deviceType
+      - deviceName
+      - deviceType
+      - device (when it is a plain string)
+    """
+    def _clean(value):
+        return value.strip() if isinstance(value, str) else None
+
+    candidates = []
+
+    # Nested device block first (common for NISO101 / NISO103 payloads)
     device_block = json_data.get("device")
-
-    # NISO206 is a reference-only device: it sends cuff-style BP (bp.BPSYS/BPDIA) and no
-    # pleth. Route it to the reference pathway (PATHWAY 1) so it updates the reference BP
-    # with the existing 15-minute cooldown — never used for pleth/BP estimation.
-    _dn = None
     if isinstance(device_block, dict):
-        _dn = device_block.get("deviceName") or device_block.get("deviceType")
+        candidates.extend([
+            device_block.get("deviceName"),
+            device_block.get("deviceType"),
+        ])
     elif isinstance(device_block, str):
-        _dn = device_block
-    if isinstance(_dn, str) and _dn.strip() == "NISO206":
-        return DEVICE_LS06
+        candidates.append(device_block)
 
-    if isinstance(device_block, dict):
-        nested_name = device_block.get("deviceName")
-        if isinstance(nested_name, str):
-            nested_name = nested_name.strip()
-            if nested_name in _DEVICE_INPUT_MAP:
-                return _DEVICE_INPUT_MAP[nested_name]
-            if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
-                return nested_name
+    # Top-level fallbacks
+    candidates.extend([
+        json_data.get("deviceName"),
+        json_data.get("deviceType"),
+        json_data.get("device"),
+    ])
 
-        nested_type = device_block.get("deviceType")
-        if isinstance(nested_type, str):
-            nested_type = nested_type.strip()
-            if nested_type in _DEVICE_INPUT_MAP:
-                return _DEVICE_INPUT_MAP[nested_type]
-            if nested_type in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
-                return nested_type
-    elif isinstance(device_block, str):
-        nested_name = device_block.strip()
-        if nested_name in _DEVICE_INPUT_MAP:
-            return _DEVICE_INPUT_MAP[nested_name]
-        if nested_name in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
-            return nested_name
+    # Explicitly accept the common vendor aliases used by the pipeline.
+    for raw in candidates:
+        value = _clean(raw)
+        if not value:
+            continue
+        if value == "NISO206":
+            return DEVICE_LS06
+        if value in _DEVICE_INPUT_MAP:
+            return _DEVICE_INPUT_MAP[value]
+        if value in {DEVICE_BERRYMED, DEVICE_CHECKME, DEVICE_NISO204}:
+            return value
 
-    # No recognised deviceName — fall back to bp field presence (LS06 cuff)
+    # No recognised device marker — fall back to bp field presence (LS06 cuff)
     if "bp" in json_data:
         return DEVICE_LS06
     return "UNKNOWN"

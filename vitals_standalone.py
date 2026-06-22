@@ -246,8 +246,9 @@ def _preprocess_signal(raw_pleth, source_hz, target_hz, device_type):
         
     # 2. CHECKME (NISO 103)
     elif device_type == DEVICE_CHECKME:
-        # CheckmeProcessor returns (normalised, t_axis, denoised, filtered, quality_info)
-        results = PROCESSORS["CHECKME"].process_data(raw_pleth)
+        # CheckmeProcessor returns (normalised, t_axis, denoised, filtered, quality_info).
+        # Use the auto-sensed source_hz (not the fixed 125) so the filter matches.
+        results = PROCESSORS["CHECKME"].process_data(raw_pleth, override_fs=source_hz)
         clean_signal = results[0]
         sqi_info = results[4]
         
@@ -521,6 +522,14 @@ def process_vitals(json_data):
         or pleth_obj.get("pleth_wave")
         or []
     )
+
+    # CHECKME (NISO103) epochs are 30s but the real sample rate varies by firmware
+    # (~100-120 Hz). Auto-sense it from the sample count instead of assuming 125 Hz,
+    # so the bandpass / beat-timing math matches the actual signal.
+    if device_type == DEVICE_CHECKME and raw_pleth:
+        sensed_hz = round(len(raw_pleth) / 30)
+        if 80 <= sensed_hz <= 200:
+            actual_hz = sensed_hz
 
     # 1. Clean and enforce 120Hz
     model_ready_pleth, sqi_info = _preprocess_signal(raw_pleth, actual_hz, 120, device_type)

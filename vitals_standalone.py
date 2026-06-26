@@ -173,6 +173,31 @@ _DEVICE_HZ_MAP = {
     DEVICE_BERRYMED: 200,
 }
 
+def _resolve_facility(obj, _depth=0):
+    """Find a facility id in ANY form, for the temporary facility gate — top-level or
+    nested, any case/separator variant (facilityId / facility_id / FACILITY-ID / …),
+    a plain `facility` string, or a nested `facility` object carrying an id. Returns
+    the first facility-like value found, else None."""
+    if not isinstance(obj, dict) or _depth > 5:
+        return None
+    for k, v in obj.items():
+        kn = str(k).lower().replace("_", "").replace("-", "").replace(" ", "")
+        if kn in ("facilityid", "facility", "facilitycode"):
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if isinstance(v, dict):                      # e.g. {"facility": {"id": "CF..."}}
+                for ik, iv in v.items():
+                    ikn = str(ik).lower().replace("_", "").replace("-", "").replace(" ", "")
+                    if ikn in ("id", "facilityid", "code", "value") and isinstance(iv, str) and iv.strip():
+                        return iv.strip()
+    for v in obj.values():                               # recurse into nested blocks
+        if isinstance(v, dict):
+            r = _resolve_facility(v, _depth + 1)
+            if r:
+                return r
+    return None
+
+
 def _detect_device(json_data):
     """
     Resolve the device type from either nested or top-level fields.
@@ -400,15 +425,14 @@ def process_vitals(json_data):
     adm_id = json_data.get("admissionId") or json_data.get("PatId") or json_data.get("deviceID") or json_data.get("BLEDeviceID", "UNKNOWN_PATIENT")
 
     # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────────
-    # Accept incoming data AND emit output ONLY for the ls.gncl facility
-    # (CF1315821527). Any other facility's data is ignored (no processing, no
-    # output). Configurable via EBP_ALLOWED_FACILITY. REMOVE after the trial.
+    # Work ONLY for the ls.gncl facility (CF1315821527). Any other facility →
+    # return None: do nothing and emit no packet at all. Configurable via
+    # EBP_ALLOWED_FACILITY (set empty to disable). REMOVE after the trial.
     _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527")
     if _allowed_facility:
-        _fac = json_data.get("facilityId") or json_data.get("facilityID") or json_data.get("FacilityId")
+        _fac = _resolve_facility(json_data)
         if _fac != _allowed_facility:
-            return {"status": "ignored", "admissionId": adm_id, "facilityId": _fac,
-                    "message": f"Facility {_fac} not enabled (temporary gate: only {_allowed_facility})."}
+            return None
 
     device_type = _detect_device(json_data)
 

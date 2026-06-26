@@ -398,6 +398,18 @@ def _compute_trends(session):
 def process_vitals(json_data):
     """Takes JSON, identifies device, routes to DSP, and returns AI predictions."""
     adm_id = json_data.get("admissionId") or json_data.get("PatId") or json_data.get("deviceID") or json_data.get("BLEDeviceID", "UNKNOWN_PATIENT")
+
+    # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────────
+    # Accept incoming data AND emit output ONLY for the ls.gncl facility
+    # (CF1315821527). Any other facility's data is ignored (no processing, no
+    # output). Configurable via EBP_ALLOWED_FACILITY. REMOVE after the trial.
+    _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527")
+    if _allowed_facility:
+        _fac = json_data.get("facilityId") or json_data.get("facilityID") or json_data.get("FacilityId")
+        if _fac != _allowed_facility:
+            return {"status": "ignored", "admissionId": adm_id, "facilityId": _fac,
+                    "message": f"Facility {_fac} not enabled (temporary gate: only {_allowed_facility})."}
+
     device_type = _detect_device(json_data)
 
     # --- PATHWAY 1: THE BP CUFF (Update Reference Storage) ---

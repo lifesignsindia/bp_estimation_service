@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 import traceback
@@ -26,7 +27,7 @@ sys.stdout.flush()
 print("[IMPORT] Loading vitals_standalone...")
 sys.stdout.flush()
 try:
-    from vitals_standalone import process_vitals
+    from vitals_standalone import process_vitals, _resolve_facility
     print("[IMPORT] vitals_standalone loaded OK")
     sys.stdout.flush()
 except Exception as e:
@@ -159,6 +160,17 @@ def run():
 
         adm_id = payload.get("admissionId", "UNKNOWN")
 
+        # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────
+        # Only work for the ls.gncl facility (CF1315821527). Any other facility's
+        # packet is dropped here — no parsing, no inference, no output produced.
+        # Configurable via EBP_ALLOWED_FACILITY; set it empty to disable. REMOVE
+        # after the trial.
+        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527")
+        if _allowed_fac:
+            _fac = _resolve_facility(payload)
+            if _fac != _allowed_fac:
+                continue
+
         # Support both nested and top-level device metadata. Some payloads expose
         # deviceType inside the nested object instead of deviceName.
         _dev_block = payload.get("device", {})
@@ -197,6 +209,9 @@ def run():
             traceback.print_exc()
             sys.stdout.flush()
             _debug("INFERENCE_ERROR", str(e), adm_id)
+            continue
+
+        if result is None:        # facility-gated (or otherwise no-op) → emit nothing
             continue
 
         _msg_count += 1

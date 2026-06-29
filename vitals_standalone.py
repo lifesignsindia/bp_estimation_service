@@ -420,6 +420,47 @@ def _compute_trends(session):
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Main Processing Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
+def _scrub_outliers(arr, lo, hi):
+    """Return a SAME-LENGTH array with noise outliers replaced by the inlier median:
+    samples outside the physiological range [lo,hi] OR beyond the 1.5×IQR fence are
+    swapped for the median of the good samples; everything else is kept as-is. Returns
+    None (leave untouched) if there are too few samples to judge."""
+    nums = sorted(float(x) for x in arr
+                  if isinstance(x, (int, float)) and lo <= float(x) <= hi)
+    if len(nums) < 4:
+        return None
+    n = len(nums)
+    q1, q3 = nums[n // 4], nums[(3 * n) // 4]
+    iqr = q3 - q1
+    med = nums[n // 2] if n % 2 else 0.5 * (nums[n // 2 - 1] + nums[n // 2])
+    f_lo = q1 - 1.5 * iqr if iqr > 0 else lo
+    f_hi = q3 + 1.5 * iqr if iqr > 0 else hi
+    rep = int(round(med))
+    out = []
+    for x in arr:
+        if isinstance(x, (int, float)) and lo <= float(x) <= hi and f_lo <= float(x) <= f_hi:
+            out.append(x)                          # inlier — keep original sample
+        else:
+            out.append(rep)                        # outlier — replace with median
+    return out
+
+
+def _clean_pulserate_inplace(obj, _depth=0):
+    """Scrub outliers from any `pulseRate` ARRAY found in the payload (top-level or
+    nested), in place — the array stays the same shape/length, only outlier values are
+    replaced. ONLY `pulseRate` is touched; spo2 / pi / everything else is left alone."""
+    if not isinstance(obj, dict) or _depth > 5:
+        return
+    for k, v in list(obj.items()):
+        if str(k).lower().replace("_", "").replace("-", "") == "pulserate" and isinstance(v, list):
+            cleaned = _scrub_outliers(v, 25, 250)   # plausible pulse-rate range (bpm)
+            if cleaned is not None:
+                obj[k] = cleaned
+    for v in obj.values():
+        if isinstance(v, dict):
+            _clean_pulserate_inplace(v, _depth + 1)
+
+
 def process_vitals(json_data):
     """Takes JSON, identifies device, routes to DSP, and returns AI predictions."""
     adm_id = json_data.get("admissionId") or json_data.get("PatId") or json_data.get("deviceID") or json_data.get("BLEDeviceID", "UNKNOWN_PATIENT")
@@ -433,6 +474,11 @@ def process_vitals(json_data):
         _fac = _resolve_facility(json_data)
         if _fac != _allowed_facility:
             return None
+
+    # Scrub noise outliers from the pulseRate array (only pulseRate). The array keeps
+    # its shape — outlier samples are replaced by the inlier median — so the output
+    # payload carries the same spo2 structure with a de-noised pulseRate.
+    _clean_pulserate_inplace(json_data)
 
     device_type = _detect_device(json_data)
 

@@ -165,10 +165,11 @@ def run():
         # packet is dropped here — no parsing, no inference, no output produced.
         # Configurable via EBP_ALLOWED_FACILITY; set it empty to disable. REMOVE
         # after the trial.
-        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527")
+        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF557841749")
         if _allowed_fac:
+            _allowed_set = {f.strip() for f in _allowed_fac.split(",") if f.strip()}
             _fac = _resolve_facility(payload)
-            if _fac != _allowed_fac:
+            if _fac not in _allowed_set:
                 continue
 
         # Support both nested and top-level device metadata. Some payloads expose

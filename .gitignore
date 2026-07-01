@@ -41,3 +41,4 @@ saved_good_niso103_sample.json
 inspect_other_dbs.py
 inspect_db.py
 debug_plot_payload.json
+docs/PIPELINE_PAYLOAD.md

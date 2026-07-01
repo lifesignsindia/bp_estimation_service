@@ -421,10 +421,12 @@ def _compute_trends(session):
 # 5. Main Processing Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 def _niso101_pr_from_pr_all(json_data):
-    """NISO101 (BerryMed) ONLY: the incoming `spo2` block carries a per-sample pulse-rate
-    array under `PR_ALL`. Set `spo2.PR` = mean of the physiologically-plausible
-    (25-220 bpm) samples. `PR_ALL` and everything else in `spo2` (including the SpO2
-    samples) are left EXACTLY as received; no other device is affected."""
+    """NISO101 (BerryMed) ONLY, on the incoming `spo2` block:
+      • `spo2.PR`   = mean of the physiologically-plausible (25-220 bpm) samples of the
+                      per-sample `PR_ALL` array.
+      • `spo2.SPO2` = the SpO2 value re-keyed from `spo2.SpO2` to uppercase `SPO2`
+                      (value sent as-is; the `SpO2` key is dropped).
+    `PR_ALL` is left in place; no other device is affected."""
     sp = json_data.get("spo2")
     if not isinstance(sp, dict):
         return
@@ -433,6 +435,11 @@ def _niso101_pr_from_pr_all(json_data):
         vals = [float(x) for x in arr if isinstance(x, (int, float)) and 25 <= float(x) <= 220]
         if vals:
             sp["PR"] = int(round(sum(vals) / len(vals)))
+    # send spo2.SpO2 as spo2.SPO2 (value unchanged, just the key uppercased)
+    if "SpO2" in sp:
+        sp["SPO2"] = sp.pop("SpO2")
+    elif "spo2" in sp:
+        sp["SPO2"] = sp.pop("spo2")
 
 
 def process_vitals(json_data):
@@ -452,10 +459,9 @@ def process_vitals(json_data):
 
     device_type = _detect_device(json_data)
 
-    # NISO101 (BerryMed) ONLY: the spo2 block carries a per-sample pulse-rate array
-    # under `PR_ALL`. Add `spo2.PR` = mean of the plausible (25-220 bpm) samples;
-    # `PR_ALL` and the spo2/SpO2 samples are left untouched. NISO103 and every other
-    # device are left exactly as they were before the PR changes.
+    # NISO101 (BerryMed) ONLY: add `spo2.PR` = mean of plausible (25-220 bpm) PR_ALL
+    # samples, and re-key `spo2.SpO2` → `spo2.SPO2`. `PR_ALL` is kept. NISO103 and every
+    # other device are left exactly as they were before the PR changes.
     if device_type == DEVICE_BERRYMED:
         _niso101_pr_from_pr_all(json_data)
 

@@ -421,12 +421,10 @@ def _compute_trends(session):
 # 5. Main Processing Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 def _niso101_pr_from_pr_all(json_data):
-    """NISO101 (BerryMed) ONLY, on the incoming `spo2` block:
-      • `spo2.PR`   = mean of the physiologically-plausible (25-220 bpm) samples of the
-                      per-sample `PR_ALL` array (single averaged pulse rate).
-      • `spo2.SPO2` = the `spo2` sample array sent AS-IS, RENAMED to uppercase (the
-                      lowercase `spo2.spo2` is dropped — only `spo2.SPO2` remains).
-    `PR_ALL` (the array) is left in place; no other device is affected."""
+    """NISO101 (BerryMed) ONLY: the incoming `spo2` block carries a per-sample pulse-rate
+    array under `PR_ALL`. Set `spo2.PR` = mean of the physiologically-plausible
+    (25-220 bpm) samples. `PR_ALL` and everything else in `spo2` (including the SpO2
+    samples) are left EXACTLY as received; no other device is affected."""
     sp = json_data.get("spo2")
     if not isinstance(sp, dict):
         return
@@ -435,8 +433,6 @@ def _niso101_pr_from_pr_all(json_data):
         vals = [float(x) for x in arr if isinstance(x, (int, float)) and 25 <= float(x) <= 220]
         if vals:
             sp["PR"] = int(round(sum(vals) / len(vals)))
-    if isinstance(sp.get("spo2"), list):
-        sp["SPO2"] = sp.pop("spo2")            # re-key spo2 → SPO2 (drop lowercase)
 
 
 def process_vitals(json_data):
@@ -458,8 +454,8 @@ def process_vitals(json_data):
 
     # NISO101 (BerryMed) ONLY: the spo2 block carries a per-sample pulse-rate array
     # under `PR_ALL`. Add `spo2.PR` = mean of the plausible (25-220 bpm) samples;
-    # `PR_ALL` (the array) is kept. NISO103 and every other device are left exactly
-    # as they were before the PR changes (no pulse-rate handling at all).
+    # `PR_ALL` and the spo2/SpO2 samples are left untouched. NISO103 and every other
+    # device are left exactly as they were before the PR changes.
     if device_type == DEVICE_BERRYMED:
         _niso101_pr_from_pr_all(json_data)
 

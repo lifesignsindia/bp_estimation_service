@@ -486,33 +486,36 @@ def process_vitals(json_data):
                 "message": f"Device error sentinel received ({sys_val}/{dia_val}). Cuff reading ignored."
             }
         
-        # --- CASE 2: REFERENCE COOLDOWN (Error Protection) ---
-        # If we successfully confirmed a calibration recently, ignore random/mistaken cuff readings
+        # --- CASE 2: REFERENCE HANDLING ---
         now = time.time()
         session = _session_read(adm_id)
-        if session:
+
+        # Read OLD reference before overwriting — needed to detect if value changed.
+        prev_ref = _ref_read(adm_id)
+        # Did the cuff value actually change vs the stored reference?
+        ref_changed = (abs(prev_ref.get("sbp", 0) - sys_val) >= 5 or
+                       abs(prev_ref.get("dbp", 0) - dia_val) >= 5)
+        # A MANUAL reference (staff-entered) is deliberate; so is any genuinely NEW cuff
+        # value. Accept those IMMEDIATELY — do not sit in the 15-min stability cooldown.
+        _is_manual = bool(json_data.get("isManual")) or (json_data.get("deviceName") == "MANUAL")
+
+        # The cooldown now ONLY suppresses repeated / IDENTICAL re-sends of the same value
+        # (Nexus re-broadcasts the same manual reference); this is what prevents the
+        # infinite loop of immediate checks and repeated ALERT outputs. A changed or
+        # manual reference is always taken.
+        if session and not ref_changed and not _is_manual:
             last_confirm = session.get("last_confirmation_time", 0)
             if (now - last_confirm) < 900:
                 return {
                     "status": "ignored",
                     "admissionId": adm_id,
-                    "message": f"Reference ignored. System is in 15-minute stability cooldown ({(now - last_confirm)/60:.1f}m elapsed)."
+                    "message": f"Duplicate reference ignored (value unchanged, {(now - last_confirm)/60:.1f}m into stability window)."
                 }
-
-        # Read OLD reference before overwriting — needed to detect if value changed
-        prev_ref = _ref_read(adm_id)
 
         # Store this as the ground truth for this patient
         _ref_write(adm_id, sys_val, dia_val, json_data.get("epochTime", 0))
-        print(f"[REF]  Reference BP received | admissionId={adm_id} | SBP={sys_val} DBP={dia_val}")
+        print(f"[REF]  Reference BP received | admissionId={adm_id} | SBP={sys_val} DBP={dia_val} | manual={_is_manual} changed={ref_changed}")
         sys.stdout.flush()
-
-        # Trigger an immediate AI confirmation on the next pleth packet ONLY if
-        # the reference values actually changed (new cuff reading from staff).
-        # Do NOT reset if the same value comes in repeatedly — that causes an
-        # infinite loop of immediate checks and repeated ALERT outputs.
-        ref_changed = (abs(prev_ref.get("sbp", 0) - sys_val) >= 5 or
-                       abs(prev_ref.get("dbp", 0) - dia_val) >= 5)
 
         if session is None:
             _needs_recal = _recal_read(adm_id)

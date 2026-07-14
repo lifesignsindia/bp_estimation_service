@@ -9,12 +9,6 @@ ENV/
 .vscode/
 .idea/
 *.log
-*.json
-model_lab/
-analysis_app/
-test_pipeline/
-csv_analysis/
-*.csv
 *.png
 *.mp4
 *1.json
@@ -52,7 +46,3 @@ pr_handling/pr_handling.py
 pr_handling/README.md
 2.json
 pleth_analysis/analyze_pleth.py
-csv_analysis/analyze_bp.py
-dbb.py
-ebp_readings.db
-Daywise reference BP,Glucose,HB.xlsx

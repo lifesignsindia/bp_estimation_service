@@ -56,3 +56,18 @@ csv_analysis/analyze_bp.py
 dbb.py
 ebp_readings.db
 Daywise reference BP,Glucose,HB.xlsx
+
+# PlethGuard runtime output (do not commit)
+plethguard/*.jsonl
+
+# --- Local patient-data dumps & archives — NEVER commit (privacy + repo size) ---
+admission_json/
+spo2_priority_json/
+ADM[0-9]*/
+NEXADM*/
+*.zip
+Low Saturation*.xlsx
+SpO2 Alerts*.xlsx
+ALERTS_*.xlsx
+niso 103 rejected pleth/
+spo2_pull_priority_ids.txt

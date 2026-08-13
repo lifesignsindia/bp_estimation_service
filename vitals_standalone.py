@@ -58,15 +58,6 @@ DEVICE_CHECKME  = "CHECKME"
 DEVICE_BERRYMED = "BERRYMED"
 DEVICE_LS06     = "LS06"
 
-# Hb recalibration — the Hb model systematically OVER-READS by a roughly constant offset
-# (cohort mean estimate ~12.8 vs lab ~9.1 g/dL). Subtracting it recenters the output and cut
-# mean error 3.93 -> 2.40 g/dL (~39%) in analysis. This is a cohort-derived LEVEL correction,
-# not a per-patient measurement (pleth morphology carries little true Hb signal), so Hb stays
-# a screening indicator. Retune if the patient population changes; set 0.0 to disable.
-# Glucose is intentionally left uncorrected — no recalibration improved it.
-HB_BIAS_G_DL = 3.5
-HB_OUTPUT_LIMITS = (3.0, 20.0)
-
 _DEVICE_NAME_MAP = {
     "BERRYMED": "NISO101",
     "CHECKME":  "NISO103",
@@ -396,30 +387,12 @@ def _blend_with_reference(sbp, dbp, ref_sbp, ref_dbp):
 
     sbp_gap = abs(sbp_float - ref_sbp_float)
     dbp_gap = abs(dbp_float - ref_dbp_float)
+    blend_weight = 0.50 if (sbp_gap >= 15 or dbp_gap >= 10) else 0.35
 
-    # FIX #2 — high-BP cuff-trust ramp + under-read floor. The raw AI delta is clipped to
-    # +-15 around the category base, so the estimate saturates and structurally UNDER-READS
-    # as true BP climbs. Lean progressively harder on the verified cuff from 140->180 sys /
-    # 90->120 dia (weight base -> 0.90). Below those thresholds np.interp returns the base
-    # weight, so the blend is IDENTICAL to the previous logic (0.50 if the estimate is far
-    # from the cuff, else 0.35) — normal/low BP is unchanged. The floor stops a saturated
-    # estimate from dragging a very high cuff down (ref_sbp>=160 -> est>=ref-12; ref_dbp>=100
-    # -> est>=ref-8). Validated read-only on prod (fidelity 2.7-8.9 mmHg; high-BP mean sys
-    # error 22.6 -> 4.6 mmHg). Cuff-driven: improves magnitude at the cuff, not between-cuff
-    # trend — so it depends on references staying fresh.
-    base_s = 0.50 if sbp_gap >= 15 else 0.35
-    base_d = 0.50 if dbp_gap >= 10 else 0.35
-    weight_s = max(base_s, float(np.interp(ref_sbp_float, [140.0, 180.0], [base_s, 0.90])))
-    weight_d = max(base_d, float(np.interp(ref_dbp_float, [90.0, 120.0], [base_d, 0.90])))
-
-    cal_sbp = (1.0 - weight_s) * sbp_float + weight_s * ref_sbp_float
-    cal_dbp = (1.0 - weight_d) * dbp_float + weight_d * ref_dbp_float
-    if ref_sbp_float >= 160.0:
-        cal_sbp = max(cal_sbp, ref_sbp_float - 12.0)
-    if ref_dbp_float >= 100.0:
-        cal_dbp = max(cal_dbp, ref_dbp_float - 8.0)
-    return (int(np.clip(round(cal_sbp), *cfg.BP_SBP_LIMITS)),
-            int(np.clip(round(cal_dbp), *cfg.BP_DBP_LIMITS)))
+    cal_sbp = int(round((1.0 - blend_weight) * sbp_float + blend_weight * ref_sbp_float))
+    cal_dbp = int(round((1.0 - blend_weight) * dbp_float + blend_weight * ref_dbp_float))
+    return (int(np.clip(cal_sbp, *cfg.BP_SBP_LIMITS)),
+            int(np.clip(cal_dbp, *cfg.BP_DBP_LIMITS)))
 
 
 def _compute_trends(session):
@@ -470,7 +443,7 @@ def process_vitals(json_data):
     # Work ONLY for the ls.gncl facility (CF1315821527). Any other facility →
     # return None: do nothing and emit no packet at all. Configurable via
     # EBP_ALLOWED_FACILITY (set empty to disable). REMOVE after the trial.
-    _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF557841749,CF1398828720")
+    _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF557841749,CF106335369")
     if _allowed_facility:
         _allowed_set = {f.strip() for f in _allowed_facility.split(",") if f.strip()}
         _fac = _resolve_facility(json_data)
@@ -612,16 +585,6 @@ def process_vitals(json_data):
         or []
     )
 
-    # FIX #1 — NISO103 signed-int8 wraparound. CHECKME sends the pleth as SIGNED int8,
-    # but the true signal is UNSIGNED 0-255. Any true value > 127 wraps to a negative
-    # (e.g. 130 -> -126), turning pulse PEAKS into deep troughs and making the AI read BP
-    # far too low — worst at high BP, where more peaks cross 127. Re-read as unsigned
-    # (x + 256 for negatives) so the waveform shape, and thus the estimate, are correct.
-    # NISO103/CHECKME only; a no-op on clean epochs and untouched for other devices.
-    if device_type == DEVICE_CHECKME and isinstance(raw_pleth, list):
-        raw_pleth = [(x + 256 if isinstance(x, (int, float)) and x < 0 else x)
-                     for x in raw_pleth]
-
     # CHECKME (NISO103) epochs are 30s but the real sample rate varies by firmware
     # (~100-120 Hz). Auto-sense it from the sample count instead of assuming 125 Hz,
     # so the bandpass / beat-timing math matches the actual signal.
@@ -705,11 +668,6 @@ def process_vitals(json_data):
         dbp_pred = int(round(float(ai_results.get("dbp", 80)))) if bp_valid else 80
         hb_pred  = ai_results.get("hb", "N/A") if bp_valid else "N/A"
         glu_pred = ai_results.get("glucose", "N/A") if bp_valid else "N/A"
-        # Recenter Hb by the known systematic over-read (see HB_BIAS_G_DL). Applied here so
-        # both the per-packet value and the 15-min average (which averages these) are
-        # corrected. Glucose is passed through unchanged.
-        if isinstance(hb_pred, (int, float)):
-            hb_pred = round(float(np.clip(hb_pred - HB_BIAS_G_DL, *HB_OUTPUT_LIMITS)), 1)
 
         # Raw model delta for trend tracking (always computed before any correction)
         model_cat_raw  = ai_results.get("category", "normal")

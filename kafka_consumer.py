@@ -165,7 +165,7 @@ def run():
         # packet is dropped here — no parsing, no inference, no output produced.
         # Configurable via EBP_ALLOWED_FACILITY; set it empty to disable. REMOVE
         # after the trial.
-        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF557841749,CF1398828720")
+        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF557841749,CF106335369")
         if _allowed_fac:
             _allowed_set = {f.strip() for f in _allowed_fac.split(",") if f.strip()}
             _fac = _resolve_facility(payload)

@@ -73,3 +73,12 @@ niso 103 rejected pleth/
 spo2_pull_priority_ids.txt
 Leelavathi_ecg_json/
 
+inference_engine_notchfix.py
+inference_engine_polfix.py
+pleth_capture/
+.gitignore
+plethguard/plethguard_service.py
+Leelavathi.docx
+plethguard/plethguard.env.example
+plethguard/plethguard_service.py
+plethguard/plethguard_service.py

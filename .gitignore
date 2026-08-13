@@ -9,12 +9,6 @@ ENV/
 .vscode/
 .idea/
 *.log
-*.json
-model_lab/
-analysis_app/
-test_pipeline/
-csv_analysis/
-*.csv
 *.png
 *.mp4
 *1.json
@@ -52,24 +46,32 @@ pr_handling/pr_handling.py
 pr_handling/README.md
 2.json
 pleth_analysis/analyze_pleth.py
-csv_analysis/analyze_bp.py
-dbb.py
-ebp_readings.db
-Daywise reference BP,Glucose,HB.xlsx
-
-# PlethGuard runtime output (do not commit)
-plethguard/*.jsonl
-
-# --- Local patient-data dumps & archives — NEVER commit (privacy + repo size) ---
-admission_json/
-spo2_priority_json/
-ADM[0-9]*/
-NEXADM*/
+ADM878207965.zip
+ADM1013075949_BP.json
+*.json
+*.csv
+.*xlsx
 *.zip
-Low Saturation*.xlsx
-SpO2 Alerts*.xlsx
-ALERTS_*.xlsx
-niso 103 rejected pleth/
+model_lab/
+*.jsonl
+pleth_capture/
+csv_analysis/
+.gitignore
+inference_engine_polfix.py
+analysis_app/
+plethguard/plethguard.env.example
+ALERTS_CONFIRMED_BY_NEXT_CUFF.xlsx
+ALERTS_ESTIMATE_MATCHED_NEXTREF.xlsx
+ebp_readings.db
+dbb.py
+Daywise reference BP,Glucose,HB.xlsx
+inference_engine_notchfix.py
+Leelavathi.docx
+Low Saturation_23_07_2026.xlsx
+SpO2 Alerts_27.xlsx
 spo2_pull_priority_ids.txt
-Leelavathi_ecg_json/
-
+niso 103 rejected pleth/README.md
+niso 103 rejected pleth/niso101_vs_niso103/README.md
+niso 103 rejected pleth/poor_raw_vs_processed/README.md
+test_pipeline/fix2_test.py
+test_pipeline/test_niso103.py

@@ -154,9 +154,39 @@ class VitalInferenceEngine:
         return filtfilt(b, a, sig)
 
     def _preprocess(self, sig):
-        """0.4 Hz highpass + Savgol smoothing — matches danger_v2.py preprocessing."""
+        """0.4 Hz highpass + Savgol smoothing — matches danger_v2.py preprocessing.
+
+        FIX #3 — PULSE POLARITY. NISO101 delivers the pleth INVERTED relative to the
+        physiological orientation the features assume: measured on 1,023 saved NISO101 epochs,
+        69% have negative skew, i.e. the systolic peaks point DOWN. Everything downstream —
+        crest time, dicrotic notch, augmentation/reflection index, upstroke — is then measured
+        on an upside-down beat, and noise Gate 6 (skew must sit in [-2, 5]) rejects 15.2% of
+        epochs outright, 63 of which are salvageable by a flip alone.
+
+        A real pleth pulse is POSITIVELY skewed: a sharp systolic peak above a long diastolic
+        baseline. Negative skew therefore means inverted, and flipping restores the true shape.
+        Skew is scale-invariant and sign-flips exactly with the signal, which makes it the
+        right detector here; a threshold of 0 with a small dead-band avoids flip-flopping on
+        near-symmetric (mostly unusable) segments.
+
+        DEFAULT OFF (EBP_POLARITY_FIX=1 to enable). The flip is physiologically correct, but
+        measured on 1,023 NISO101 epochs it barely helps yield (769 -> 775 usable, 25% -> 24%)
+        while drastically moving the SHIPPED classifier: mean top-class confidence 0.565 ->
+        0.697 and the 'hypo' band 43% -> 84%. That is expected — the classifier is a fixed
+        linear model fitted to the OLD (un-flipped) feature distribution, so correcting the
+        input without retraining just relocates the error. Enabling this before the classifier
+        is retrained on flipped features would push most patients onto the hypo base (90 mmHg)
+        with no evidence it is more accurate. Validate against the CIMS cuff references first.
+        """
         hp = self._highpass(sig)
-        return savgol_filter(hp, window_length=11, polyorder=3)
+        out = savgol_filter(hp, window_length=11, polyorder=3)
+        if os.getenv("EBP_POLARITY_FIX", "0") == "1":
+            sd = float(np.std(out))
+            if sd > 1e-9:
+                sk = float(np.mean(((out - out.mean()) / sd) ** 3))
+                if sk < -0.15:          # dead-band: only flip a clearly inverted pulse
+                    out = -out
+        return out
 
     def _interpolate_peak(self, sig, idx):
         if idx <= 0 or idx >= len(sig) - 1:

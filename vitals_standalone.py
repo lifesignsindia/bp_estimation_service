@@ -325,12 +325,18 @@ def _to_seconds(t):
     return float(t) / 1000.0 if t > 1e11 else float(t)
 
 
+# How far the device epochTime may sit from the wall clock before it is distrusted. A day in
+# production; set it very large (e.g. 10 years) to REPLAY historical captures through the
+# pipeline with their original timestamps, so slots and gaps follow device time.
+EPOCH_TS_MAX_SKEW_SEC = float(os.getenv("EBP_EPOCH_TS_MAX_SKEW_SEC", "86400"))
+
+
 def _epoch_ts(json_data):
     """Time of this pleth epoch, used for the 15-minute slot key. The device epochTime when
-    it is plausible (within a day of now), else the wall clock."""
+    it is plausible (within EPOCH_TS_MAX_SKEW_SEC of now), else the wall clock."""
     t = _to_seconds(json_data.get("epochTime"))
     now = time.time()
-    if t is None or abs(t - now) > 86400:
+    if t is None or abs(t - now) > EPOCH_TS_MAX_SKEW_SEC:
         return now
     return t
 

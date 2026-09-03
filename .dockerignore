@@ -1,0 +1,56 @@
+# Only the runtime needs to reach the image:
+#   kafka_consumer.py vitals_standalone.py v7_engine.py bpv4_features.py inference_engine.py
+#   mongo_sink.py config.py processors/ models/ requirements.txt
+# Everything else is analysis, dashboards, captured patient data or secrets.
+
+.git
+.gitignore
+.dockerignore
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# secrets / credentials — never bake into an image
+*.pem
+*.key
+.env
+.env.*
+**/users.json
+**/login_history.json
+
+# local databases and captured data
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+*.jsonl.gz
+*.xlsx
+*.csv
+*.zip
+*.log
+pleth_capture/
+**/pleth_capture/
+**/collected_json/
+
+# dashboards, analysis, experiments — not part of the pipeline
+ebp_dashboard/
+analysis_app/
+csv_analysis/
+model_lab/
+pleth_analysis/
+plethguard_dashboard/
+plethguard_dashboard.zip
+pr_handling/
+improvements/
+validation/
+_archive/
+docs/
+test_app/
+test_pipeline/
+sample_payloads/
+payload_alert.json
+payload_success.json
+inference_engine_notchfix.py
+inference_engine_polfix.py
+test_redis_tls.py
+docker-compose.yml

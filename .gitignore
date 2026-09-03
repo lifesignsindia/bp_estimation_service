@@ -59,7 +59,6 @@ csv_analysis/
 .gitignore
 inference_engine_polfix.py
 analysis_app/
-plethguard/plethguard.env.example
 ALERTS_CONFIRMED_BY_NEXT_CUFF.xlsx
 ALERTS_ESTIMATE_MATCHED_NEXTREF.xlsx
 ebp_readings.db
@@ -75,3 +74,4 @@ niso 103 rejected pleth/niso101_vs_niso103/README.md
 niso 103 rejected pleth/poor_raw_vs_processed/README.md
 test_pipeline/fix2_test.py
 test_pipeline/test_niso103.py
+plethguard_dashboard/

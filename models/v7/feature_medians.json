@@ -1,0 +1,21 @@
+{
+  "source": "mimic_windows.pkl nanmedian over 17249 windows",
+  "medians": {
+    "crest_time": 0.1899970251375874,
+    "dvp_time": 0.1821462721634839,
+    "stiffness_idx": 5.490093143945643,
+    "si_crest": 0.5263240274486426,
+    "pulse_width_50": 0.348,
+    "pulse_width_25": 0.56,
+    "pulse_width_75": 0.224,
+    "aix": -0.5268412976248138,
+    "ri": 0.47315870137089194,
+    "ipa": 0.3446148032346692,
+    "max_upstroke": 9.862791185303452,
+    "upstroke_ratio": 0.028732556513103448,
+    "apg_b_a": -0.810554353999458,
+    "aging_index": -0.9734313418912536,
+    "auc_norm": 0.4271105771755556,
+    "decay_slope": -0.005345760757677481
+  }
+}

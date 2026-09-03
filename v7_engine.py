@@ -312,7 +312,8 @@ class V7Engine(object):
             s["win_key"], s["win_first_ts"] = key, ts
         s["win_epochs"] += 1
         if good:
-            s["win"].append([round(sbp, 1), round(dbp, 1), hb, glu])
+            # unrounded, so the slot median is bit-identical to the dashboard runtime's
+            s["win"].append([sbp, dbp, hb, glu])
         out["alert"] = s["alert"]
         out["trend"] = self.trend(s)
         out["run"] = s["run"]

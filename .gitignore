@@ -75,3 +75,8 @@ niso 103 rejected pleth/poor_raw_vs_processed/README.md
 test_pipeline/fix2_test.py
 test_pipeline/test_niso103.py
 plethguard_dashboard/
+CF1398828720_spo2_sqi_3h.xlsx
+_archive/data_dumps/root_ebp_readings.db
+# the v7 engine needs these two JSON files at runtime — keep them despite *.json above
+!models/v7/v7_manifest.json
+!models/v7/feature_medians.json

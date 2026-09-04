@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import config as cfg
+import mongo_sink          # no-op unless MONGO_SINK_ENABLED=1
 
 print("[CFG]  ==================== PIPELINE STARTING ====================")
 print("[CFG]  KAFKA_BROKERS      =", cfg.KAFKA_BROKERS)
@@ -35,13 +36,10 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
-# TEMPORARY (ebp-dashboard field test): forward the meaningful per-patient states
-# that normally only go to logs — "accumulating" (interim estimates), "poor_signal"
-# (flat/poor signal) and "error" — so the dashboard can mirror each patient's real
-# state, not just final BP. ("ignored" = device-lock/cooldown housekeeping is left out.)
-# This raises output volume substantially.
-# REVERT after testing → restore to {"success", "alert"}. Safe state: tag `working_pipeline`.
-FORWARD_STATUSES = {"success", "alert", "accumulating", "poor_signal", "error"}
+# Only the closed 15-minute window reaches Kafka. Per-epoch states (accumulating,
+# calibrating, poor/flat signal, no reference, errors) are logged below and dropped —
+# v7 publishes one payload per patient per 15-minute slot, nothing in between.
+FORWARD_STATUSES = {"success", "alert"}
 
 consumer = Consumer({
     "bootstrap.servers":    cfg.KAFKA_BROKERS,
@@ -230,6 +228,12 @@ def run():
                     value=json.dumps(out).encode(),
                     callback=_delivery_cb,
                 )
+                # Mirror the SAME payload into its own MongoDB database. Best-effort and
+                # off unless MONGO_SINK_ENABLED=1; it cannot raise and cannot block the
+                # publish above. Writes to MONGO_SINK_DB (default ebp_shadow), never to
+                # `local`, so no production collection is touched.
+                mongo_sink.write(out, status=status, adm_id=adm_id,
+                                 topic=cfg.KAFKA_OUTPUT_TOPIC)
                 _flush_counter += 1
                 if _flush_counter >= _FLUSH_EVERY:
                     producer.flush(timeout=5)

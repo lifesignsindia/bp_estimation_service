@@ -29,8 +29,8 @@ except ImportError as e:
     print("Ensure your 'processors' folder has an __init__.py and the AI files are present.")
     sys.exit(1)
 
-# ─── AI Engine ───────────────────────────────────────────────────────────────
-print("[AI]   Loading models into memory...")
+# ─── Legacy AI Engine — Hb / glucose ONLY (BP is v7, see below) ───────────────
+print("[AI]   Loading legacy Hb/glucose models into memory...")
 sys.stdout.flush()
 try:
     ai_engine = VitalInferenceEngine()
@@ -57,6 +57,15 @@ DEVICE_NISO204  = "NISO204"
 DEVICE_CHECKME  = "CHECKME"
 DEVICE_BERRYMED = "BERRYMED"
 DEVICE_LS06     = "LS06"
+
+# Hb recalibration — the Hb model systematically OVER-READS by a roughly constant offset
+# (cohort mean estimate ~12.8 vs lab ~9.1 g/dL). Subtracting it recenters the output and cut
+# mean error 3.93 -> 2.40 g/dL (~39%) in analysis. This is a cohort-derived LEVEL correction,
+# not a per-patient measurement (pleth morphology carries little true Hb signal), so Hb stays
+# a screening indicator. Retune if the patient population changes; set 0.0 to disable.
+# Glucose is intentionally left uncorrected — no recalibration improved it.
+HB_BIAS_G_DL = 3.5
+HB_OUTPUT_LIMITS = (3.0, 20.0)
 
 _DEVICE_NAME_MAP = {
     "BERRYMED": "NISO101",
@@ -141,6 +150,19 @@ def _primary_write(adm_id, device_type):
 def _primary_read(adm_id):
     raw = _redis.get(f"primary:{adm_id}")
     return raw if raw else None
+
+# ─── v7 BP engine ─────────────────────────────────────────────────────────────
+# BP is owned by v7 (delta-from-cuff model, 15-minute wall-clock slots, latched alert).
+# Its per-admission state lives in Redis next to the cuff reference, so it survives
+# restarts and is shared across pods. The legacy engine above is kept ONLY for Hb and
+# glucose. See v7_engine.py and docs/V7_PIPELINE.md.
+try:
+    from v7_engine import V7Engine, WINDOW_SEC as V7_WINDOW_SEC
+    v7_engine = V7Engine(_redis)
+except Exception as e:
+    print(f"[V7]   FATAL: v7 engine failed to load — {e}")
+    sys.stdout.flush()
+    sys.exit(1)
 
 # ─── Session helpers (Redis-backed, survives restarts & works across pods) ────
 SESSION_TTL = 7200  # 2 hours — longer than any possible 15-min session
@@ -293,130 +315,56 @@ def _preprocess_signal(raw_pleth, source_hz, target_hz, device_type):
     return list(clean_signal), sqi_info
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Signal Analysis Helpers
+# 4. Helpers for the v7 path
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _compute_aix(ppg, fs=120):
-    """SDPTG b/a ratio as Augmentation Index proxy. Returns None if signal insufficient."""
-    ppg = np.array(ppg, dtype=float)
-    if len(ppg) < fs * 3:
+def _to_seconds(t):
+    """Device / Nexus timestamps arrive in seconds or milliseconds. Normalise to seconds."""
+    if not isinstance(t, (int, float)) or t <= 0:
         return None
-    rng = ppg.max() - ppg.min()
-    if rng < 1e-6:
-        return None
-    ppg_n = (ppg - ppg.min()) / rng
-    wl = max(5, min(15, (len(ppg_n) // 20) * 2 + 1))
-    ppg_s = signal.savgol_filter(ppg_n, window_length=wl, polyorder=3)
-    peaks, _ = signal.find_peaks(ppg_s, distance=int(fs * 0.4), height=0.4)
-    if len(peaks) < 3:
-        return None
-    d2 = np.diff(ppg_s, n=2)
-    ratios = []
-    for pk in peaks[:-1]:
-        s = max(0, pk - int(fs * 0.05))
-        e = min(len(d2), pk + int(fs * 0.4))
-        seg = d2[s:e]
-        if len(seg) < 8:
-            continue
-        h = len(seg) // 2
-        a_val = float(seg[:h].min())
-        b_val = float(seg[max(0, h // 4): h + h // 4 + 1].max())
-        if abs(a_val) > 1e-9:
-            ratios.append(b_val / a_val)
-    return float(np.median(ratios)) if len(ratios) >= 2 else None
+    return float(t) / 1000.0 if t > 1e11 else float(t)
 
 
-def _apply_bp_offset(sbp, dbp):
-    """
-    Deterministic bias correction for NO-REFERENCE mode only.
-
-    Field testing showed the model systematically under-reads when no cuff
-    reference is set: true 120-130 patients land at ~90-100. Two explicit
-    correction cases on the SBP output, with DBP lifted in parallel:
-
-        SBP < 80             : hold +25 (avoid over-boosting genuine lows)
-        Case 1 — SBP 80-89   : lift +25..+20
-        Case 2 — SBP 90-100  : lift +20..+15  (joins Case 1 at the seam)
-        SBP > 100            : taper to 0 by ~120 (model already accurate)
-
-    The seam at SBP 90 is matched (+20) so the curve is monotonic — a higher
-    model SBP never produces a lower final reading.
-
-    Deterministic by design: the correction is a fixed function of the model
-    output, so the model's own beat-to-beat variation carries through (same
-    signal -> same number). No random jitter — a BP reading must be reproducible.
-
-    WARNING: this also lifts genuinely low readings, so it can mask real
-    hypotension. It is a TEMPORARY field-testing aid on the no-reference path
-    and must be removed once per-patient reference calibration is in place.
-    """
-    # --- SBP: two explicit under-read cases + a floor below 80 and a taper above 100 ---
-    if sbp < 80.0:
-        # Below 80 — hold the Case 1 lift (avoids over-boosting genuine lows)
-        offset_s = 25.0
-    elif sbp < 90.0:
-        # Case 1 — model SBP 80-89: lift +25..+20
-        offset_s = float(np.interp(sbp, [80.0, 89.0], [25.0, 20.0]))
-    elif sbp <= 100.0:
-        # Case 2 — model SBP 90-100: lift +20..+15 (joins Case 1 at the 89/90 seam)
-        offset_s = float(np.interp(sbp, [90.0, 100.0], [20.0, 15.0]))
-    else:
-        # Above 100 the model is already close — taper to 0 by ~120
-        offset_s = float(np.interp(sbp, [100.0, 120.0], [15.0, 0.0]))
-
-    # --- DBP: corrected in parallel with the SBP band, smaller magnitude ---
-    if dbp < 60.0:
-        offset_d = float(np.interp(dbp, [50.0, 59.0], [15.0, 12.0]))
-    elif dbp <= 70.0:
-        offset_d = float(np.interp(dbp, [60.0, 70.0], [12.0, 8.0]))
-    else:
-        offset_d = float(np.interp(dbp, [70.0, 80.0], [8.0, 0.0]))
-
-    return (int(round(float(np.clip(sbp + offset_s, *cfg.BP_SBP_LIMITS)))),
-            int(round(float(np.clip(dbp + offset_d, *cfg.BP_DBP_LIMITS)))))
+# How far the device epochTime may sit from the wall clock before it is distrusted. A day in
+# production; set it very large (e.g. 10 years) to REPLAY historical captures through the
+# pipeline with their original timestamps, so slots and gaps follow device time.
+EPOCH_TS_MAX_SKEW_SEC = float(os.getenv("EBP_EPOCH_TS_MAX_SKEW_SEC", "86400"))
 
 
-def _blend_with_reference(sbp, dbp, ref_sbp, ref_dbp):
-    if not (ref_sbp > 0 or ref_dbp > 0):
-        return int(round(float(sbp))), int(round(float(dbp)))
-
-    sbp_float = float(sbp)
-    dbp_float = float(dbp)
-    ref_sbp_float = float(ref_sbp)
-    ref_dbp_float = float(ref_dbp)
-
-    sbp_gap = abs(sbp_float - ref_sbp_float)
-    dbp_gap = abs(dbp_float - ref_dbp_float)
-    blend_weight = 0.50 if (sbp_gap >= 15 or dbp_gap >= 10) else 0.35
-
-    cal_sbp = int(round((1.0 - blend_weight) * sbp_float + blend_weight * ref_sbp_float))
-    cal_dbp = int(round((1.0 - blend_weight) * dbp_float + blend_weight * ref_dbp_float))
-    return (int(np.clip(cal_sbp, *cfg.BP_SBP_LIMITS)),
-            int(np.clip(cal_dbp, *cfg.BP_DBP_LIMITS)))
+def _epoch_ts(json_data):
+    """Time of this pleth epoch, used for the 15-minute slot key. The device epochTime when
+    it is plausible (within EPOCH_TS_MAX_SKEW_SEC of now), else the wall clock."""
+    t = _to_seconds(json_data.get("epochTime"))
+    now = time.time()
+    if t is None or abs(t - now) > EPOCH_TS_MAX_SKEW_SEC:
+        return now
+    return t
 
 
-def _compute_trends(session):
-    """Returns (trending, morphology_change) from delta history and AIx history."""
-    trending   = False
-    morphology = "stable"
-    deltas   = session.get("deltas", [])
-    baseline = session.get("baseline_delta")
-    if baseline and len(deltas) >= 3:
-        recent_mean = float(np.mean([d[0] for d in deltas[-5:]]))
-        if abs(recent_mean - baseline[0]) >= 10.0:
-            trending = True
-    aix_history = session.get("aix_history", [])
-    aix_values  = session.get("aix_values",  [])
-    if aix_history and len(aix_values) >= 3:
-        current_aix = float(np.mean(aix_values[-5:]))
-        shift = current_aix - aix_history[0]
-        if shift > 0.15:
-            morphology = "rising"
-        elif shift < -0.15:
-            morphology = "falling"
-    return trending, morphology
+def _category(sbp, dbp):
+    """Same thresholds the pipeline has always used for the reference category."""
+    if sbp < 90 or dbp < 60:
+        return "hypo"
+    if sbp > 140 or dbp > 90:
+        return "hyper"
+    return "normal"
 
 
+def _legacy_hb_glu(model_ready_pleth, age, gender, bmi, adm_id, device_type):
+    """Hb and glucose from the legacy engine. Its BP output is discarded — v7 owns BP.
+    Returns (hb, glucose), either may be None."""
+    try:
+        r = ai_engine.analyze(pleth_array=model_ready_pleth, fs=120, age=age, gender=gender,
+                              bmi=bmi, adm_id=adm_id, device_type=device_type)
+    except Exception as e:
+        print(f"[HBGLU] adm={adm_id} | legacy engine failed: {e}")
+        sys.stdout.flush()
+        return None, None
+    hb, glu = r.get("hb"), r.get("glucose")
+    # Recenter Hb by the known systematic over-read (see HB_BIAS_G_DL).
+    hb = round(float(np.clip(float(hb) - HB_BIAS_G_DL, *HB_OUTPUT_LIMITS)), 1) if isinstance(hb, (int, float)) else None
+    glu = int(round(float(glu))) if isinstance(glu, (int, float)) else None
+    return hb, glu
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Main Processing Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -585,6 +533,16 @@ def process_vitals(json_data):
         or []
     )
 
+    # FIX #1 — NISO103 signed-int8 wraparound. CHECKME sends the pleth as SIGNED int8,
+    # but the true signal is UNSIGNED 0-255. Any true value > 127 wraps to a negative
+    # (e.g. 130 -> -126), turning pulse PEAKS into deep troughs and making the AI read BP
+    # far too low — worst at high BP, where more peaks cross 127. Re-read as unsigned
+    # (x + 256 for negatives) so the waveform shape, and thus the estimate, are correct.
+    # NISO103/CHECKME only; a no-op on clean epochs and untouched for other devices.
+    if device_type == DEVICE_CHECKME and isinstance(raw_pleth, list):
+        raw_pleth = [(x + 256 if isinstance(x, (int, float)) and x < 0 else x)
+                     for x in raw_pleth]
+
     # CHECKME (NISO103) epochs are 30s but the real sample rate varies by firmware
     # (~100-120 Hz). Auto-sense it from the sample count instead of assuming 125 Hz,
     # so the bandpass / beat-timing math matches the actual signal.
@@ -634,391 +592,123 @@ def process_vitals(json_data):
 
     pleth_out = [round(float(x), 6) for x in model_ready_pleth]
 
-    # 2. Extract demographics for the AI
+    # 2. Demographics — only the legacy Hb / glucose engine uses them
     age = json_data.get("Age", 35)
     gender = json_data.get("Gender", "Male")
     bmi = json_data.get("BMI", 24)
 
-    # 3. Call the AI Engine
+    now = time.time()
+    dev_name = _DEVICE_NAME_MAP.get(device_type, device_type)
+    common = {**_meta, "admissionId": adm_id, "deviceName": dev_name,
+              "deviceType": "BP_SPO2", "timestamp": int(now)}
+
     try:
-        # Retrieve the latest reference BP for this patient from Redis
+        # 3. Hb / glucose — legacy engine on the 120 Hz cleaned signal (BP output ignored)
+        hb_pred, glu_pred = _legacy_hb_glu(model_ready_pleth, age, gender, bmi, adm_id, device_type)
+
+        # 4. BP — v7 on the RAW samples at the device rate. v7 does its own polarity
+        #    correction, band-pass, beat ensemble and quality gate, exactly as validated.
         patient_ref = _ref_read(adm_id)
-        if patient_ref.get("sbp", 0) > 0:
-            print(f"[REF]  Using reference | admissionId={adm_id} | SBP={patient_ref['sbp']} DBP={patient_ref['dbp']}")
+        ref_s = patient_ref.get("sbp", 0) or 0
+        ref_d = patient_ref.get("dbp", 0) or 0
+        ref_ts = _to_seconds(patient_ref.get("timestamp"))
+        epoch_ts = _epoch_ts(json_data)
+        if ref_s > 0:
+            print(f"[REF]  Using reference | admissionId={adm_id} | SBP={ref_s} DBP={ref_d}")
             sys.stdout.flush()
 
-        ai_results = ai_engine.analyze(
-            pleth_array=model_ready_pleth,
-            fs=120,
-            age=age,
-            gender=gender,
-            bmi=bmi,
-            adm_id=adm_id,
-            device_type=device_type
-        )
+        v7_in = [float(v) for v in raw_pleth if isinstance(v, (int, float, np.integer, np.floating))]
+        res = v7_engine.score_epoch(adm_id, v7_in, fs=actual_hz, ts=epoch_ts,
+                                    ref_sbp=ref_s, ref_dbp=ref_d, ref_ts=ref_ts,
+                                    extras=(hb_pred, glu_pred))
 
-        # 4. CONSOLE LOGGING (STDOUT) - Always visible, not the formal payload
-        bp_valid = "sbp" in ai_results
-        if not bp_valid:
-            n_samples = len(model_ready_pleth)
-            reason = "short_packet" if n_samples < 1800 else "insufficient_segments"
-            print(f"[INF]  adm={adm_id} | device={device_type} | samples={n_samples} | inference_failed={reason}")
-            sys.stdout.flush()
-        sbp_pred = int(round(float(ai_results.get("sbp", 120)))) if bp_valid else 120
-        dbp_pred = int(round(float(ai_results.get("dbp", 80)))) if bp_valid else 80
-        hb_pred  = ai_results.get("hb", "N/A") if bp_valid else "N/A"
-        glu_pred = ai_results.get("glucose", "N/A") if bp_valid else "N/A"
+        sqi_out = {**(sqi_info if isinstance(sqi_info, dict) else {}),
+                   "v7_quality": res["quality"],
+                   "n_beats": res["n_beats"],
+                   "template_corr": res["template_corr"]}
+        ev = res["epoch_value"]
+        ow = res.get("open_window") or {}
+        anchor = res.get("anchor") or {}
+        print(f"[V7]   adm={adm_id} | {res['state']} | q={res['quality']} beats={res['n_beats']} "
+              f"corr={res['template_corr']} | epoch={ev[0] if ev else '-'}/{ev[1] if ev else '-'} "
+              f"| anchor={anchor.get('sbp', '-')}/{anchor.get('dbp', '-')} {res['calibrating']} "
+              f"| slot good={ow.get('n_good', 0)}/{ow.get('n_epochs', 0)} | hb={hb_pred} glu={glu_pred} "
+              f"| alert={res['alert'] or '-'}")
+        sys.stdout.flush()
 
-        # Raw model delta for trend tracking (always computed before any correction)
-        model_cat_raw  = ai_results.get("category", "normal")
-        base_s_raw, base_d_raw = cfg.BP_CATEGORY_BASES.get(model_cat_raw, (118.0, 76.0))
-        pkt_delta_s = (float(ai_results["sbp"]) - base_s_raw) if bp_valid else None
-        pkt_delta_d = (float(ai_results["dbp"]) - base_d_raw) if bp_valid else None
+        win = res["window"]
+        if win is None:
+            # ── per-epoch states: LOGGED by the consumer, never published ──────────────
+            if res["state"] == "no reference":
+                return {**common, "status": "ignored", "sqi": sqi_out,
+                        "message": "No reference cuff yet. v7 estimates change from a cuff, so nothing to anchor to."}
+            if res["state"] == "calibrating":
+                return {**common, "status": "accumulating", "sqi": sqi_out,
+                        "elapsed_seconds": 0, "target_seconds": int(V7_WINDOW_SEC), "bp": {},
+                        "message": f"Building v7 anchor ({res['calibrating']} good epochs after the cuff)."}
+            if not res["good"]:
+                return {**common, "status": "poor_signal", "sqi": sqi_out,
+                        "message": f"Epoch dropped from the 15-minute slot (v7 quality={res['quality']}, "
+                                   f"beats={res['n_beats']}, corr={res['template_corr']})."}
+            elapsed = int(epoch_ts - (ow.get("since") or epoch_ts))
+            return {**common, "status": "accumulating", "sqi": sqi_out,
+                    "elapsed_seconds": elapsed, "target_seconds": int(V7_WINDOW_SEC),
+                    "bp": {"estimated_sbp": ev[0], "estimated_dbp": ev[1]} if ev else {},
+                    "message": f"15-minute slot accumulating ({ow.get('n_good', 0)} good epochs)."}
 
-        # AIx from this packet
-        aix = _compute_aix(model_ready_pleth, fs=120)
+        # ── a 15-minute slot closed: the ONE payload per slot that reaches Kafka ─────────
+        sbp, dbp = int(round(win["sbp"])), int(round(win["dbp"]))
+        ref_sbp_i = int(round(anchor["sbp"])) if anchor.get("sbp") is not None else 0
+        ref_dbp_i = int(round(anchor["dbp"])) if anchor.get("dbp") is not None else 0
+        trend = res["trend"]
+        label = trend.get("trend", "")
+        morphology = "rising" if label.startswith("Rising") else ("falling" if label.startswith("Falling") else "stable")
 
-        # Cross-category correction: if ref category differs from model category,
-        # re-root the AI's delta onto the reference category base
-        ref_s = patient_ref.get("sbp", 0)
-        ref_d = patient_ref.get("dbp", 0)
-        ai_sbp_raw = sbp_pred
-        ai_dbp_raw = dbp_pred
-        if bp_valid and ref_s > 0 and ref_d > 0:
-            if ref_s < 90 or ref_d < 60:
-                ref_cat = "hypo"
-            elif ref_s > 140 or ref_d > 90:
-                ref_cat = "hyper"
-            else:
-                ref_cat = "normal"
-            if model_cat_raw != ref_cat:
-                r_base_s, r_base_d = cfg.BP_CATEGORY_BASES.get(ref_cat, (118.0, 76.0))
-                sbp_pred = int(round(float(np.clip(r_base_s + pkt_delta_s, *cfg.BP_SBP_LIMITS))))
-                dbp_pred = int(round(float(np.clip(r_base_d + pkt_delta_d, *cfg.BP_DBP_LIMITS))))
-
-        raw_sbp_pred = sbp_pred
-        raw_dbp_pred = dbp_pred
-        # Calibration TARGET for this packet. With a reference, the value actually
-        # emitted is EASED toward this target after the session loads (see below),
-        # so a new/changed reference moves the output gradually, not in one jump.
-        if ref_s > 0 and ref_d > 0:
-            cal_sbp, cal_dbp = _blend_with_reference(raw_sbp_pred, raw_dbp_pred, ref_s, ref_d)
-        elif bp_valid:
-            # NO-REFERENCE calibration — temporary field-testing aid. See _apply_bp_offset.
-            # raw_sbp_pred / raw_dbp_pred stay uncorrected for trend-delta tracking below.
-            cal_sbp, cal_dbp = _apply_bp_offset(sbp_pred, dbp_pred)
-        else:
-            cal_sbp, cal_dbp = sbp_pred, dbp_pred
-        sbp_pred, dbp_pred = cal_sbp, cal_dbp
-
-        # 5. INITIALIZE SESSION STATE
-        now = time.time()
-
-        session = _session_read(adm_id)
-        if session is None:
-            _needs_recal = _recal_read(adm_id)
-            session = {
-                "start_time": now,
-                "readings": [],
-                "raw_readings": [],
-                "is_first_reading": {},
-                "last_packet_time": {},
-                "needs_recalibration": _needs_recal,
-                "current_interval": 1200 if _needs_recal else 900,
-                "last_confirmation_time": 0,
-                "deltas": [],
-                "baseline_delta": None,
-                "aix_values": [],
-                "aix_history": [],
-            }
-
-        # --- GAP RE-ARM ---
-        # If this device has been silent for >= 20 minutes, treat the reconnect as a fresh
-        # first reading: clear the stale window and re-compare the recent packet against the
-        # stored reference instead of averaging it into hours-old data.
-        _last_pkt = session.setdefault("last_packet_time", {}).get(device_type, 0)
-        if _last_pkt > 0 and (now - _last_pkt) >= 1200:
-            print(f"[GAP] adm={adm_id} | {device_type} | gap={int(now - _last_pkt)}s >= 1200s -> re-arming first-reading check")
-            sys.stdout.flush()
-            session["is_first_reading"][device_type] = True
-            session["readings"] = []
-            session["raw_readings"] = []
-            session["start_time"] = now
-            session.pop("cal_offset_s", None)   # re-seed easing after a long gap
-            session.pop("cal_offset_d", None)
-        session["last_packet_time"][device_type] = now
-
-        # --- CALIBRATION EASING (reference path only) ---
-        # The raw AI estimate passes straight through; only the reference-induced
-        # correction (cal_target - raw) is eased in via an EMA. So when a new or
-        # changed reference shifts the blend target, the emitted value moves toward
-        # it gradually over several readings instead of snapping — making it easy to
-        # see how the model converges, while real AI changes still show immediately.
-        # NOTE: the offset persists across windows; it is only re-seeded on a fresh
-        # session or a long gap. A new reference is NOT a reset — it eases.
-        if bp_valid and ref_s > 0 and ref_d > 0:
-            EASE_ALPHA = 0.25
-            target_off_s = cal_sbp - raw_sbp_pred
-            target_off_d = cal_dbp - raw_dbp_pred
-            prev_off_s = session.get("cal_offset_s")
-            prev_off_d = session.get("cal_offset_d")
-            if prev_off_s is None:          # first reading after a (re)set — seed, no ease
-                off_s, off_d = target_off_s, target_off_d
-            else:
-                off_s = prev_off_s + EASE_ALPHA * (target_off_s - prev_off_s)
-                off_d = prev_off_d + EASE_ALPHA * (target_off_d - prev_off_d)
-            session["cal_offset_s"] = off_s
-            session["cal_offset_d"] = off_d
-            sbp_pred = int(round(float(np.clip(raw_sbp_pred + off_s, *cfg.BP_SBP_LIMITS))))
-            dbp_pred = int(round(float(np.clip(raw_dbp_pred + off_d, *cfg.BP_DBP_LIMITS))))
-
-        # 6. SESSION FLAGS
-        has_reference = patient_ref.get("sbp", 0) > 0 or patient_ref.get("dbp", 0) > 0
-        is_immediate  = has_reference and session["is_first_reading"].get(device_type, True)
-
-        if is_immediate and not bp_valid:
-            _session_write(adm_id, session)
-            return {**_meta,
-                "status": "poor_signal",
-                "admissionId": adm_id,
-                "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
-                "deviceType": "BP_SPO2",
-                "timestamp": int(now),
-                "sqi": sqi_info,
-                "message": "Poor signal on first packet. Waiting for clean signal."
-            }
-
-        if bp_valid:
-            print(f"[RT_LOG] Admission: {adm_id} | AI Estimate: {sbp_pred}/{dbp_pred} | Hb: {hb_pred} | Glu: {glu_pred}")
-            sys.stdout.flush()
-
-        # First reading check — identical logic to test_pipeline
-        if is_immediate and bp_valid:
-            ref_sbp = patient_ref.get("sbp", 0)
-            ref_dbp = patient_ref.get("dbp", 0)
-            if ref_sbp > 0 or ref_dbp > 0:
-                # Has reference: compare raw AI output vs cuff reading
-                sbp_mismatch = (ref_sbp > 0 and abs(ref_sbp - raw_sbp_pred) >= 15)
-                dbp_mismatch = (ref_dbp > 0 and abs(ref_dbp - raw_dbp_pred) >= 10)
-                alert_msg = f"Initial Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, AI={raw_sbp_pred}/{raw_dbp_pred}."
-            else:
-                # No reference: physiological range check
-                sbp_mismatch = (raw_sbp_pred > 140 or raw_sbp_pred < 90)
-                dbp_mismatch = (raw_dbp_pred > 90  or raw_dbp_pred < 60)
-                alert_msg = f"Physiological Alert: AI={raw_sbp_pred}/{raw_dbp_pred} outside normal range."
-
-            if sbp_mismatch or dbp_mismatch:
-                session["needs_recalibration"] = True
-                session["is_first_reading"][device_type] = False
-                _recal_write(adm_id, True)
-                print(f"[ALERT] adm={adm_id} | raw_AI={raw_sbp_pred}/{raw_dbp_pred} | ref={ref_sbp}/{ref_dbp} | {alert_msg}")
-                sys.stdout.flush()
-                alert_payload = {**_meta,
-                    "status": "alert",
-                    "admissionId": adm_id,
-                    "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
-                    "deviceType": "BP_SPO2",
-                    "timestamp": int(now),
-                    "message": alert_msg,
-                    "bp": {
-                        "estimated_sbp": sbp_pred, "estimated_dbp": dbp_pred,
-                        "category": ai_results.get("category", "Unknown"),
-                        "trend": ai_results.get("trend", {"trend": "Stable ->", "slope": 0.0, "readings": 0}),
-                        "reference_sbp": ref_sbp,
-                        "reference_dbp": ref_dbp
-                    },
-                    "sqi": sqi_info,
-                    "pleth": {"PLETH": pleth_out},
-                }
-                if hb_pred != "N/A":
-                    alert_payload["hemoglobin"] = hb_pred
-                if glu_pred != "N/A":
-                    alert_payload["glucose"] = glu_pred
-                _session_write(adm_id, session)
-                return alert_payload
-
-        # First reading done — subsequent packets from this device go to the window
-        if is_immediate:
-            session["is_first_reading"][device_type] = False
-
-        # 7. OUTPUT LOGIC (15-min window accumulation)
-        if bp_valid:
-            session.setdefault("raw_readings", []).append((raw_sbp_pred, raw_dbp_pred, hb_pred, glu_pred))
-            session["readings"].append((sbp_pred, dbp_pred, hb_pred, glu_pred))
-            if pkt_delta_s is not None:
-                session["deltas"].append((pkt_delta_s, pkt_delta_d))
-        if aix is not None:
-            session["aix_values"].append(aix)
-
-        target_interval = session.get("current_interval", 900)
-        elapsed = now - session["start_time"]
-
-        if not is_immediate and elapsed < target_interval:
-            trending, morphology = _compute_trends(session)
-            if not bp_valid:
-                _session_write(adm_id, session)
-                return {**_meta,
-                    "status": "poor_signal",
-                    "admissionId": adm_id,
-                    "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
-                    "deviceType": "BP_SPO2",
-                    "timestamp": int(now),
-                    "sqi": sqi_info,
-                    "trending": trending,
-                    "morphology_change": morphology,
-                    "pleth": {"PLETH": pleth_out},
-                    "message": "Poor signal during accumulation window. Waiting for valid packet."
-                }
-            acc = {**_meta,
-                "status": "accumulating",
-                "admissionId": adm_id,
-                "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
-                "deviceType": "BP_SPO2",
-                "elapsed_seconds": int(elapsed),
-                "target_seconds": int(target_interval),
-                "bp": {
-                    "estimated_sbp": sbp_pred,
-                    "estimated_dbp": dbp_pred,
-                    "category": ai_results.get("category", "Unknown"),
-                },
-                "sqi": sqi_info,
-                "trending": trending,
-                "morphology_change": morphology,
-                "pleth": {"PLETH": pleth_out},
-                "message": f"Stability period in progress ({int(elapsed)}/{int(target_interval)}s)."
-            }
-            if hb_pred != "N/A":
-                acc["hemoglobin"] = hb_pred
-            if glu_pred != "N/A":
-                acc["glucose"] = glu_pred
-            _session_write(adm_id, session)
-            return acc
-
-        # Timer Expired -> Finalise window trends, then calculate averages
-        trending, morphology = _compute_trends(session)
-
-        aix_vals = session.get("aix_values", [])
-        if aix_vals:
-            session["aix_history"].append(float(np.mean(aix_vals)))
-        session["aix_values"] = []
-
-        window_deltas = session.get("deltas", [])
-        if window_deltas and session.get("baseline_delta") is None:
-            session["baseline_delta"] = (
-                float(np.mean([d[0] for d in window_deltas])),
-                float(np.mean([d[1] for d in window_deltas])),
-            )
-        session["deltas"] = []
-
-        raw_readings = session.get("raw_readings", [])
-        readings = session["readings"]
-
-        if not raw_readings and not readings:
-            session["start_time"] = now
-            _session_write(adm_id, session)
-            return {**_meta,
-                "status": "poor_signal",
-                "admissionId": adm_id,
-                "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
-                "deviceType": "BP_SPO2",
-                "timestamp": int(now),
-                "sqi": sqi_info,
-                "pleth": {"PLETH": pleth_out},
-                "message": "No valid signal in window. All packets had poor signal quality."
-            }
-
-        raw_avg_sbp = int(np.mean([r[0] for r in raw_readings])) if raw_readings else int(np.mean([r[0] for r in readings]))
-        raw_avg_dbp = int(np.mean([r[1] for r in raw_readings])) if raw_readings else int(np.mean([r[1] for r in readings]))
-        avg_sbp = int(np.mean([r[0] for r in readings])) if readings else raw_avg_sbp
-        avg_dbp = int(np.mean([r[1] for r in readings])) if readings else raw_avg_dbp
-
-        if not has_reference and aix_vals and window_deltas:
-            mean_aix     = float(np.mean(aix_vals))
-            mean_delta_s = float(np.mean([d[0] for d in window_deltas]))
-            mean_delta_d = float(np.mean([d[1] for d in window_deltas]))
-            aix_cat = "hyper" if mean_aix > 0.0 else ("hypo" if mean_aix < -0.3 else "normal")
-            base_s, base_d = cfg.BP_CATEGORY_BASES[aix_cat]
-            avg_sbp = int(round(float(np.clip(base_s + mean_delta_s, *cfg.BP_SBP_LIMITS))))
-            avg_dbp = int(round(float(np.clip(base_d + mean_delta_d, *cfg.BP_DBP_LIMITS))))
-        
-        valid_hb = [r[2] for r in readings if isinstance(r[2], (int, float)) and r[2] != "N/A"]
-        valid_glu = [r[3] for r in readings if isinstance(r[3], (int, float)) and r[3] != "N/A"]
-        avg_hb  = round(float(np.mean(valid_hb)), 1) if valid_hb else "N/A"
-        avg_glu = int(np.mean(valid_glu)) if valid_glu else "N/A"
-
-        # Final Check: Mismatch on the 15-minute average (Both SBP and DBP)
-        ref_sbp = patient_ref.get("sbp", 0)
-        ref_dbp = patient_ref.get("dbp", 0)
-        final_status = "success"
-        final_msg = "Immediate initial reading confirmed." if is_immediate else "15-minute averaged clinical payload."
-        
-        if ref_sbp > 0 or ref_dbp > 0:
-            # Blend the RAW average toward reference for the display value, but run the
-            # mismatch check on the RAW average so real deviations are not masked by blending.
-            avg_sbp, avg_dbp = _blend_with_reference(raw_avg_sbp, raw_avg_dbp, ref_sbp, ref_dbp)
-            sbp_avg_mismatch = (ref_sbp > 0 and abs(ref_sbp - raw_avg_sbp) >= 15)
-            dbp_avg_mismatch = (ref_dbp > 0 and abs(ref_dbp - raw_avg_dbp) >= 15)
-        else:
-            sbp_avg_mismatch = (avg_sbp > 140 or avg_sbp < 90)
-            dbp_avg_mismatch = (avg_dbp > 90  or avg_dbp < 60)
-
-        if sbp_avg_mismatch or dbp_avg_mismatch:
+        if win["alert"]:
             final_status = "alert"
-            final_msg = f"Averaged Calibration Mismatch: Cuff={ref_sbp}/{ref_dbp}, Raw_AI_Avg={raw_avg_sbp}/{raw_avg_dbp}, Display={avg_sbp}/{avg_dbp}."
-            session["needs_recalibration"] = True
-            _recal_write(adm_id, True)
-            print(f"[ALERT] adm={adm_id} | raw_AI_avg={raw_avg_sbp}/{raw_avg_dbp} | ref={ref_sbp}/{ref_dbp} | display={avg_sbp}/{avg_dbp}")
+            final_msg = (f"v7 alert {win['alert']} {'raised' if win['alert_new'] else 'active'}: "
+                         f"15-min median {sbp}/{dbp} vs cuff {ref_sbp_i}/{ref_dbp_i} "
+                         f"(latched until a new cuff).")
+            print(f"[ALERT] adm={adm_id} | v7_median={sbp}/{dbp} | cuff={ref_sbp_i}/{ref_dbp_i} | {win['alert']} | new={win['alert_new']}")
             sys.stdout.flush()
         else:
-            session["needs_recalibration"] = False
-            _recal_write(adm_id, False)
+            final_status = "success"
+            final_msg = (f"15-minute v7 median ({win['n_good']} good of {win['n_epochs']} epochs, "
+                         f"{'established' if win['established'] else 'first window'}).")
 
-        # Reset Session State
-        # Only start the 15-minute cooldown timer if there is NO mismatch (successful calibration).
-        # We do NOT start it during a mismatch, so clinical staff can take a new cuff reading immediately.
-        if not session["needs_recalibration"]:
-            session["last_confirmation_time"] = now
-
-        if session["needs_recalibration"]:
-            session["current_interval"] = 1200
-        else:
-            session["current_interval"] = 900
-
-        session["start_time"] = now
-        session["readings"] = []
-        session["raw_readings"] = []
-
-        # 8. Construct Final FORMAL JSON
-        final_payload = {**_meta,
+        final_payload = {**common,
             "status": final_status,
-            "admissionId": adm_id,
-            "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
-            "deviceType": "BP_SPO2",
-            "timestamp": int(now),
-            "reading_count": len(readings),
+            "reading_count": win["n_good"],
+            "confidence": "HIGH" if win["established"] else "LOW",
             "bp": {
-                "estimated_sbp": avg_sbp,
-                "estimated_dbp": avg_dbp,
-                "category": ai_results.get("category", "Unknown"),
-                "trend": ai_results.get("trend", {"trend": "Stable ->", "slope": 0.0, "readings": 0}),
+                "estimated_sbp": sbp,
+                "estimated_dbp": dbp,
+                "category": _category(sbp, dbp),
+                "trend": trend,
+                "reference_sbp": ref_sbp_i,
+                "reference_dbp": ref_dbp_i,
                 "BP_ERROR": 0
             },
-            "sqi": sqi_info,
-            "trending": trending,
+            "alert": win["alert"],
+            "sqi": sqi_out,
+            "trending": bool(win["hot"]),
             "morphology_change": morphology,
+            "window": {"start": int(win["start"]), "end": int(win["end"]),
+                       "good_epochs": win["n_good"], "epochs": win["n_epochs"],
+                       "established": bool(win["established"])},
             "pleth": {"PLETH": pleth_out},
             "message": final_msg
         }
-        if avg_hb != "N/A":
-            final_payload["hemoglobin"] = avg_hb
-        if avg_glu != "N/A":
-            final_payload["glucose"] = avg_glu
-
-        _session_write(adm_id, session)
+        if win["hb"] is not None:
+            final_payload["hemoglobin"] = win["hb"]
+        if win["glucose"] is not None:
+            final_payload["glucose"] = win["glucose"]
+        print(f"[RT_LOG] Admission: {adm_id} | v7 15-min: {sbp}/{dbp} | Hb: {win['hb']} | Glu: {win['glucose']} | {final_status}")
+        sys.stdout.flush()
         return final_payload
     except Exception as e:
-        # Skip the bad packet but PRESERVE the accumulation window — one malformed packet
-        # must not discard minutes of already-collected valid readings.
+        # Skip the bad packet. v7 state was saved by the engine before anything could raise
+        # here, so the open slot is preserved.
         print(f"[ERR] Packet processing failed for {adm_id}: {e} -- packet skipped, window preserved.")
         sys.stdout.flush()
         return {"status": "error", "admissionId": adm_id, "message": f"AI Inference Failed: {str(e)}"}

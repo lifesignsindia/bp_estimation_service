@@ -24,7 +24,7 @@ import bpv4_features as V   # noqa: E402
 
 BROKER = os.getenv("KAFKA_BROKERS", "localhost:9092")
 IN, OUT = "vitals.raw", "vitals.clinical"
-FAC = "CF1398828720"
+FAC = os.getenv("SMOKE_FACILITY", "CF1315821527")     # must be in the pipeline's EBP_ALLOWED_FACILITY
 ADM = "ADM_DOCKER_%s" % uuid.uuid4().hex[:6]
 N_EPOCHS = int(os.getenv("SMOKE_EPOCHS", "30"))
 

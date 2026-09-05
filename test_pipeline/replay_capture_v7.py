@@ -30,7 +30,7 @@ from confluent_kafka import Producer, Consumer, TopicPartition
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BROKER = os.getenv("KAFKA_BROKERS", "localhost:9092")
 IN, OUT = "vitals.raw", "vitals.clinical"
-FAC = os.getenv("REPLAY_FACILITY", "CF1398828720")
+FAC = os.getenv("REPLAY_FACILITY", "CF1315821527")     # must be in the pipeline's EBP_ALLOWED_FACILITY
 IST = timezone(timedelta(hours=5, minutes=30))
 
 

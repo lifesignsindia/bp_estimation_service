@@ -20,7 +20,7 @@ import sys
 import json
 import glob
 
-os.environ.setdefault("EBP_ALLOWED_FACILITY", "CF1398828720")
+os.environ.setdefault("EBP_ALLOWED_FACILITY", "CF1315821527")
 os.environ.setdefault("REDIS_HOST", "localhost")
 
 import fakeredis                       # noqa: E402
@@ -33,7 +33,7 @@ import numpy as np                     # noqa: E402
 import vitals_standalone as VS         # noqa: E402
 import bpv4_features as V              # noqa: E402
 
-FAC = "CF1398828720"
+FAC = "CF1315821527"
 ADM = "ADM_TEST_V7"
 
 

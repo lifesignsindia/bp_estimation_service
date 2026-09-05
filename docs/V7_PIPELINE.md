@@ -95,8 +95,9 @@ next to `ref:{adm}` so pods and restarts share it.
 - Poor/flat epochs inside a slot are dropped, not published. Flat-line handling for the ward
   is the backend's job.
 - No estimate without a cuff. First alert ~1 h after the cuff. Alerts latch until a new cuff.
-- Kept as-is, still temporary: the facility gate (`EBP_ALLOWED_FACILITY`) and the Mongo shadow
-  sink (`MONGO_SINK_ENABLED`).
+- Kept as-is, still temporary: the facility gate (`EBP_ALLOWED_FACILITY`, default
+  `CF1315821527` only since 2026-09-05; comma-separate to add, empty to disable) and the Mongo
+  shadow sink (`MONGO_SINK_ENABLED`).
 - The cuff path (dedupe of identical re-sends within 15 min) is unchanged. v7 keys the cuff by
   its `epochTime`; a repeat that the dedupe lets through still clears the alert.
 

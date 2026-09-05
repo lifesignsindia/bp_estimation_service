@@ -391,7 +391,7 @@ def process_vitals(json_data):
     # Work ONLY for the ls.gncl facility (CF1315821527). Any other facility →
     # return None: do nothing and emit no packet at all. Configurable via
     # EBP_ALLOWED_FACILITY (set empty to disable). REMOVE after the trial.
-    _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF557841749,CF1398828720")
+    _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527")
     if _allowed_facility:
         _allowed_set = {f.strip() for f in _allowed_facility.split(",") if f.strip()}
         _fac = _resolve_facility(json_data)

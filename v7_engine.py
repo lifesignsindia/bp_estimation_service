@@ -55,6 +55,9 @@ GATE_CORR     = float(os.getenv("V7_GATE_CORR", "0.90"))
 STALE_SEC     = int(os.getenv("V7_STALE_SEC", "1800"))        # gap that discards an open slot
 STATE_TTL     = int(os.getenv("V7_STATE_TTL", "86400"))       # Redis TTL, same as the cuff ref
 MIN_SAMPLES   = int(os.getenv("V7_MIN_SAMPLES", "1200"))
+# Until the first 15-min value after a cuff, publish the CUFF itself (confidence CALIBRATING) once
+# per wall-clock slot, so the ward sees a BP ~3 min after the cuff instead of ~30. 0 = off.
+CAL_PUBLISH   = os.getenv("V7_CAL_PUBLISH", "1").strip().lower() not in ("0", "false", "no", "off", "")
 TREND_HIST    = 5                                             # slots kept for the trend field
 
 _CORE = ["aix", "ri", "ipa", "dvp_time", "stiffness_idx"]     # all-NaN together <=> no notch
@@ -72,6 +75,7 @@ def _fresh_state():
         last_ref_id=None,
         last_epoch_ts=None, last_value=None, last_value_ts=None,
         hist=[],                      # last TREND_HIST slot medians [sbp, dbp]
+        cal_key=None,                 # slot of the last CALIBRATING (cuff-value) publish
     )
 
 
@@ -212,12 +216,14 @@ class V7Engine(object):
             window       closed-slot dict (see _finalise_window) or None
             anchor       dict(sbp, dbp, key, ts) or None
             calibrating  "k/N" while the anchor is being built
+            cal          dict(sbp, dbp, key, start, end) when the cuff value should be published
+                         as CALIBRATING for this slot, else None (see CAL_PUBLISH)
             alert        latched alert string ("" if none)
             trend        legacy-shaped trend block
         """
         s = self.load_state(adm)
         out = dict(quality="", good=False, state="", epoch_value=None, window=None,
-                   n_beats=None, template_corr=None, anchor=None, calibrating="",
+                   n_beats=None, template_corr=None, anchor=None, calibrating="", cal=None,
                    alert=s["alert"], trend=self.trend(s), run=s["run"])
         hb, glu = (extras or (None, None))[:2] if extras else (None, None)
 
@@ -243,7 +249,7 @@ class V7Engine(object):
                          anchor_s=float(ref_sbp), anchor_d=float(ref_dbp or 0),
                          anchor_f=None, buf=[], run=0, hot_run=0,
                          win=[], win_key=None, win_epochs=0, win_first_ts=None,
-                         last_value=None, hist=[])
+                         last_value=None, hist=[], cal_key=None)
                 print("[V7] new anchor cuff for %s: %s/%s (ref id %s)" % (adm, ref_sbp, ref_dbp, rid))
                 sys.stdout.flush()
         out["alert"] = s["alert"]
@@ -293,6 +299,7 @@ class V7Engine(object):
                     sys.stdout.flush()
             out["state"] = "calibrating"
             out["calibrating"] = "%d/%d" % (len(s["buf"]), N_ANCHOR) if s["anchor_f"] is None else "%d/%d" % (N_ANCHOR, N_ANCHOR)
+            self._maybe_cal(s, out, ts)
             return self._finish(adm, s, out, ts)
 
         # ---- score against the anchor -------------------------------------------------------
@@ -317,6 +324,8 @@ class V7Engine(object):
         out["alert"] = s["alert"]
         out["trend"] = self.trend(s)
         out["run"] = s["run"]
+        if out["window"] is None:
+            self._maybe_cal(s, out, ts)
         if out["quality"] == "POOR":
             out["state"] = "poor signal"
         elif s["run"] >= 2:
@@ -324,6 +333,20 @@ class V7Engine(object):
         else:
             out["state"] = "accumulating"
         return self._finish(adm, s, out, ts)
+
+    @staticmethod
+    def _maybe_cal(s, out, ts):
+        """Hand back the cuff as this slot's CALIBRATING value: only while no 15-min value has been
+        published since the cuff (hist is cleared by a new cuff), at most once per wall-clock slot.
+        It is the measured cuff, not a model output, so it carries no accuracy risk."""
+        if not CAL_PUBLISH or s["anchor_key"] is None or s["hist"]:
+            return
+        key = int(ts) // WINDOW_SEC
+        if key == s.get("cal_key"):
+            return
+        s["cal_key"] = key
+        out["cal"] = dict(sbp=s["anchor_s"], dbp=s["anchor_d"], key=key,
+                          start=key * WINDOW_SEC, end=(key + 1) * WINDOW_SEC)
 
     def _finish(self, adm, s, out, ts):
         out["open_window"] = dict(key=s["win_key"], n_good=len(s["win"]), n_epochs=s["win_epochs"],

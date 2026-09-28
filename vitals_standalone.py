@@ -383,8 +383,30 @@ def _niso101_pr_from_pr_all(json_data):
             sp["PR"] = int(round(sum(vals) / len(vals)))
 
 
+# Only these statuses are meant to be SHOWN. Everything else still reaches the backend (for
+# logging / audit) but carries display=false and its BP under Estimated_sbp / Estimated_dbp,
+# so a screen reading bp.estimated_sbp never picks up a per-epoch value by accident.
+DISPLAY_STATUSES = {"success", "alert"}
+
+
 def process_vitals(json_data):
-    """Takes JSON, identifies device, routes to DSP, and returns AI predictions."""
+    """Takes JSON, identifies device, routes to DSP, and returns AI predictions.
+    Every result is tagged display=true/false; non-display results have their bp
+    estimated_sbp/estimated_dbp renamed to Estimated_sbp/Estimated_dbp."""
+    result = _process_vitals(json_data)
+    if not isinstance(result, dict):
+        return result                     # None = facility-gated, nothing to emit
+    display = result.get("status") in DISPLAY_STATUSES
+    result["display"] = display
+    bp = result.get("bp")
+    if not display and isinstance(bp, dict):
+        for k in ("sbp", "dbp"):
+            if "estimated_" + k in bp:
+                bp["Estimated_" + k] = bp.pop("estimated_" + k)
+    return result
+
+
+def _process_vitals(json_data):
     adm_id = json_data.get("admissionId") or json_data.get("PatId") or json_data.get("deviceID") or json_data.get("BLEDeviceID", "UNKNOWN_PATIENT")
 
     # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────────
@@ -637,6 +659,42 @@ def process_vitals(json_data):
         sys.stdout.flush()
 
         win = res["window"]
+        cal = res.get("cal")
+        if win is None and cal:
+            # ── CALIBRATING: the cuff itself, once per slot, until the first 15-min value ──
+            # v7 is cuff + morphology change; right after a cuff that change is ~0, so the
+            # honest value to show is the cuff. It reaches Kafka as a normal success payload.
+            c_s, c_d = int(round(cal["sbp"])), int(round(cal["dbp"]))
+            cal_payload = {**common,
+                "status": "success",
+                "reading_count": 0,
+                "confidence": "CALIBRATING",
+                "bp": {
+                    "estimated_sbp": c_s,
+                    "estimated_dbp": c_d,
+                    "category": _category(c_s, c_d),
+                    "trend": res["trend"],
+                    "reference_sbp": c_s,
+                    "reference_dbp": c_d,
+                    "BP_ERROR": 0
+                },
+                "alert": res["alert"],
+                "sqi": sqi_out,
+                "trending": False,
+                "morphology_change": "stable",
+                "window": {"start": int(cal["start"]), "end": int(cal["end"]),
+                           "good_epochs": 0, "epochs": 0, "established": False},
+                "pleth": {"PLETH": pleth_out},
+                "message": (f"Calibrating: showing the cuff reading {c_s}/{c_d} until the first v7 "
+                            f"15-minute value (anchor {res['calibrating'] or 'built'}).")
+            }
+            if hb_pred != "N/A" and hb_pred is not None:
+                cal_payload["hemoglobin"] = hb_pred
+            if glu_pred != "N/A" and glu_pred is not None:
+                cal_payload["glucose"] = glu_pred
+            print(f"[RT_LOG] Admission: {adm_id} | v7 CALIBRATING: cuff {c_s}/{c_d} | Hb: {hb_pred} | Glu: {glu_pred}")
+            sys.stdout.flush()
+            return cal_payload
         if win is None:
             # ── per-epoch states: LOGGED by the consumer, never published ──────────────
             if res["state"] == "no reference":

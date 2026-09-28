@@ -410,10 +410,10 @@ def _process_vitals(json_data):
     adm_id = json_data.get("admissionId") or json_data.get("PatId") or json_data.get("deviceID") or json_data.get("BLEDeviceID", "UNKNOWN_PATIENT")
 
     # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────────
-    # Work ONLY for the ls.gncl facility (CF1315821527). Any other facility →
+    # Work ONLY for the allowed facilities (CF1315821527, CF199221737). Any other facility →
     # return None: do nothing and emit no packet at all. Configurable via
     # EBP_ALLOWED_FACILITY (set empty to disable). REMOVE after the trial.
-    _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527")
+    _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF199221737")
     if _allowed_facility:
         _allowed_set = {f.strip() for f in _allowed_facility.split(",") if f.strip()}
         _fac = _resolve_facility(json_data)

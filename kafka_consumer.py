@@ -36,10 +36,12 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
-# Only the closed 15-minute window reaches Kafka. Per-epoch states (accumulating,
-# calibrating, poor/flat signal, no reference, errors) are logged below and dropped —
-# v7 publishes one payload per patient per 15-minute slot, nothing in between.
-FORWARD_STATUSES = {"success", "alert"}
+# Every status reaches the output topic. Only success / alert carry display=true and
+# bp.estimated_sbp/dbp; per-epoch states (accumulating, poor_signal, ignored, error) carry
+# display=false and Estimated_sbp/dbp so the backend stores them without showing them
+# (see process_vitals). EBP_FORWARD_STATUSES narrows it again, e.g. "success,alert".
+FORWARD_STATUSES = {s.strip() for s in os.getenv(
+    "EBP_FORWARD_STATUSES", "success,alert,accumulating,poor_signal,ignored,error").split(",") if s.strip()}
 
 consumer = Consumer({
     "bootstrap.servers":    cfg.KAFKA_BROKERS,
@@ -241,6 +243,8 @@ def run():
             except Exception as e:
                 print(f"[KAFKA] Produce error: {e}")
                 sys.stdout.flush()
+
+        if status in ("success", "alert"):
             bp = result.get("bp", {})
             print(f"[OUT] {status.upper()} | adm={adm_id} | EBP={bp.get('estimated_sbp','-')}/{bp.get('estimated_dbp','-')}")
             sys.stdout.flush()
@@ -250,7 +254,7 @@ def run():
             bp      = result.get("bp", {})
             elapsed = result.get("elapsed_seconds", "-")
             target  = result.get("target_seconds",  "-")
-            print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} | EBP={bp.get('estimated_sbp','-')}/{bp.get('estimated_dbp','-')}")
+            print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} | EBP={bp.get('Estimated_sbp','-')}/{bp.get('Estimated_dbp','-')} (display=false)")
             sys.stdout.flush()
             _debug("ACCUMULATING", f"{elapsed}/{target}s", adm_id, status)
 

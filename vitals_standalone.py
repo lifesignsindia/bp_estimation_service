@@ -637,6 +637,42 @@ def process_vitals(json_data):
         sys.stdout.flush()
 
         win = res["window"]
+        cal = res.get("cal")
+        if win is None and cal:
+            # ── CALIBRATING: the cuff itself, once per slot, until the first 15-min value ──
+            # v7 is cuff + morphology change; right after a cuff that change is ~0, so the
+            # honest value to show is the cuff. It reaches Kafka as a normal success payload.
+            c_s, c_d = int(round(cal["sbp"])), int(round(cal["dbp"]))
+            cal_payload = {**common,
+                "status": "success",
+                "reading_count": 0,
+                "confidence": "CALIBRATING",
+                "bp": {
+                    "estimated_sbp": c_s,
+                    "estimated_dbp": c_d,
+                    "category": _category(c_s, c_d),
+                    "trend": res["trend"],
+                    "reference_sbp": c_s,
+                    "reference_dbp": c_d,
+                    "BP_ERROR": 0
+                },
+                "alert": res["alert"],
+                "sqi": sqi_out,
+                "trending": False,
+                "morphology_change": "stable",
+                "window": {"start": int(cal["start"]), "end": int(cal["end"]),
+                           "good_epochs": 0, "epochs": 0, "established": False},
+                "pleth": {"PLETH": pleth_out},
+                "message": (f"Calibrating: showing the cuff reading {c_s}/{c_d} until the first v7 "
+                            f"15-minute value (anchor {res['calibrating'] or 'built'}).")
+            }
+            if hb_pred != "N/A" and hb_pred is not None:
+                cal_payload["hemoglobin"] = hb_pred
+            if glu_pred != "N/A" and glu_pred is not None:
+                cal_payload["glucose"] = glu_pred
+            print(f"[RT_LOG] Admission: {adm_id} | v7 CALIBRATING: cuff {c_s}/{c_d} | Hb: {hb_pred} | Glu: {glu_pred}")
+            sys.stdout.flush()
+            return cal_payload
         if win is None:
             # ── per-epoch states: LOGGED by the consumer, never published ──────────────
             if res["state"] == "no reference":

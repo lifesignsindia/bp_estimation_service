@@ -7,8 +7,11 @@ Redis connect succeeds against an in-memory store. Real NISO101 epochs from the 
 pleth capture are used so the v7 quality gate sees genuine morphology.
 
 Checks
-  1. a cuff, then epochs every 180 s -> nothing published until a 15-min slot closes
+  1. a cuff, then epochs every 180 s -> no model value published until a 15-min slot closes
   2. exactly one success/alert payload per closed slot, none in between
+  7. CALIBRATING: from the first epoch after a cuff, the cuff itself is published (confidence
+     CALIBRATING) at most once per slot, and never again once the first 15-min value is out;
+     a new cuff restarts it with the new value; V7_CAL_PUBLISH=0 switches it off
   3. flat and noisy epochs are dropped from the slot (poor_signal, not published, not counted)
   4. the published payload keeps the legacy shape (bp block, sqi, pleth, Hb/glucose, _meta)
   5. a new cuff rebuilds the anchor and clears any alert
@@ -32,6 +35,7 @@ sys.path.insert(0, _REPO)
 import numpy as np                     # noqa: E402
 import vitals_standalone as VS         # noqa: E402
 import bpv4_features as V              # noqa: E402
+import v7_engine as E7                 # noqa: E402
 
 FAC = "CF1315821527"
 ADM = "ADM_TEST_V7"
@@ -95,7 +99,8 @@ def run():
     _now = _time.time()
     t0 = _now - (_now % 900) + 30                            # 30 s into the current slot
     t = t0
-    published, statuses = [], []
+    published, statuses, cals = [], [], []
+    first_real_t = None
 
     # ---- 1. cuff, then epochs every 180 s -------------------------------------------------
     r = VS.process_vitals(cuff(120, 80, t))
@@ -103,15 +108,35 @@ def run():
     for i in range(30):                                        # 90 minutes of epochs
         t += 180
         r = VS.process_vitals(epoch(eps[i % len(eps)], t))
-        statuses.append(r["status"])
-        if r["status"] in ("success", "alert"):
+        statuses.append(r.get("confidence") or r["status"])
+        if r.get("confidence") == "CALIBRATING":
+            cals.append((t, r))
+        elif r["status"] in ("success", "alert"):
             published.append(r)
+            if first_real_t is None:
+                first_real_t = t
     print("  statuses:", statuses)
-    check(statuses[:6].count("accumulating") == 6 and VS.v7_engine.load_state(ADM)["anchor_f"] is not None,
-          "first 6 good epochs build the anchor and publish nothing")
+    check(all(st in ("accumulating", "CALIBRATING") for st in statuses[:6])
+          and VS.v7_engine.load_state(ADM)["anchor_f"] is not None,
+          "first 6 good epochs build the anchor and publish no model value")
+
+    # ---- 7. CALIBRATING = the cuff, once per slot, until the first 15-min value -----------
+    c0 = cals[0][1] if cals else {}
+    check(statuses[0] == "CALIBRATING" and c0.get("status") == "success",
+          "the FIRST epoch after the cuff publishes a CALIBRATING success payload")
+    check(c0.get("bp", {}).get("estimated_sbp") == 120 and c0.get("bp", {}).get("estimated_dbp") == 80
+          and c0["bp"].get("reference_sbp") == 120 and c0.get("alert") == "" and c0.get("reading_count") == 0,
+          "CALIBRATING value is the cuff 120/80, no alert, reading_count 0")
+    cal_slots = [int(tt) // 900 for tt, _ in cals]
+    check(len(cal_slots) == len(set(cal_slots)), f"at most one CALIBRATING payload per slot ({len(cals)} in {len(set(cal_slots))} slots)")
+    check(all(tt < first_real_t for tt, _ in cals), "no CALIBRATING payload after the first 15-min value")
+    check(published and published[0]["confidence"] == "LOW", "the first model value after CALIBRATING is LOW")
+    for k in ("status", "admissionId", "deviceName", "deviceType", "timestamp", "reading_count", "confidence",
+              "bp", "alert", "sqi", "trending", "morphology_change", "window", "pleth", "message", "patientId"):
+        check(k in c0, f"CALIBRATING payload has '{k}'")
     n_slots = len({int(s) // 900 for s in np.arange(t0 + 180 * 7, t + 1, 180)})
     check(1 <= len(published) <= n_slots, f"published {len(published)} payloads for ~{n_slots} slots touched (one per closed slot)")
-    check(all(st in ("accumulating", "success", "alert", "poor_signal") for st in statuses),
+    check(all(st in ("accumulating", "CALIBRATING", "LOW", "HIGH", "poor_signal") for st in statuses),
           "no unexpected statuses")
 
     # ---- 4. payload shape -------------------------------------------------------------------
@@ -153,13 +178,17 @@ def run():
         st = VS.v7_engine.load_state(ADM)
         # the reference is only seen by v7 on the next pleth epoch
         seq = []
+        first_after = None
         for i in range(40):                                    # 2 hours
             t += 180
             r = VS.process_vitals(epoch(eps[(i + 7) % len(eps)], t))
+            first_after = first_after or r
             seq.append((r["status"], r.get("alert", ""), r.get("confidence", "")))
         st = VS.v7_engine.load_state(ADM)
         check(st["anchor_s"] == 110.0 and st["anchor_f"] is not None, "new cuff rebuilt the anchor at 110/70")
-        pubs = [s for s in seq if s[0] in ("success", "alert")]
+        check(first_after.get("confidence") == "CALIBRATING" and first_after["bp"]["estimated_sbp"] == 110
+              and first_after["bp"]["estimated_dbp"] == 70, "a new cuff restarts CALIBRATING with the new cuff 110/70")
+        pubs = [s for s in seq if s[0] in ("success", "alert") and s[2] != "CALIBRATING"]
         print("  published after new cuff:", pubs)
         first_alert = next((i for i, s in enumerate(pubs) if s[0] == "alert"), None)
         check(first_alert is not None, "a sustained +20 mmHg delta raises an alert")
@@ -175,10 +204,25 @@ def run():
         t += 180
         r = VS.process_vitals(epoch(eps[0], t))
         st = VS.v7_engine.load_state(ADM)
-        check(st["alert"] == "" and st["anchor_f"] is None and r["status"] == "accumulating",
-              "new cuff clears the alert and starts re-calibration")
+        check(st["alert"] == "" and st["anchor_f"] is None and r.get("confidence") == "CALIBRATING"
+              and r.get("alert") == "" and r["bp"]["estimated_sbp"] == 112,
+              "new cuff clears the alert and starts re-calibration (CALIBRATING 112, no alert)")
     finally:
         VS.v7_engine._ms, VS.v7_engine._md = real_ms, real_md
+
+    # ---- 7b. V7_CAL_PUBLISH=0 -> the old behaviour, nothing until the first 15-min value ----
+    E7.CAL_PUBLISH = False
+    try:
+        t += 180
+        VS.process_vitals(cuff(125, 82, t))
+        offs = []
+        for i in range(8):
+            t += 180
+            offs.append(VS.process_vitals(epoch(eps[i], t)))
+        check(not any(o.get("confidence") == "CALIBRATING" for o in offs)
+              and offs[0]["status"] == "accumulating", "V7_CAL_PUBLISH=0: no CALIBRATING payloads")
+    finally:
+        E7.CAL_PUBLISH = True
 
     print("\n%d checks failed" % len(fails) if fails else "\nALL CHECKS PASSED")
     return 1 if fails else 0

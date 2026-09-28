@@ -18,9 +18,12 @@ vitals.raw  ─►  kafka_consumer.py  ─►  process_vitals()  ─►  vitals.
                                                     stage B  beats ≥10, template corr ≥0.90, notch → GOOD
                                                              else FAIR / POOR                        (dropped)
                                                     no cuff        → "no reference"                  (nothing)
-                                                    anchor < 6 GOOD → "calibrating"                  (nothing)
+                                                    anchor < 6 GOOD → "calibrating"                  (CALIBRATING*)
                                                     GOOD epoch      → joins the open 15-min slot
                                                     first epoch of a NEW slot closes the old one → PUBLISH
+
+  * until the first 15-min value after a cuff, the CUFF itself is published once per slot
+    (confidence CALIBRATING) — see "CALIBRATING" below
 ```
 
 The device already sends one 18-second epoch (3600 samples at 200 Hz) every 180 s per
@@ -30,6 +33,7 @@ admission, so the pipeline processes every arrival. No throttling is needed.
 
 | step | needs | earliest |
 |---|---|---|
+| CALIBRATING (the cuff value) | any non-flat epoch after the cuff | ~3 min, then once per slot |
 | anchor | 6 GOOD epochs | ~18 min |
 | first published value (`confidence: LOW`) | slot with ≥2 GOOD epochs closes | ~30–35 min |
 | established (`confidence: HIGH`) | 2 consecutive counted slots | ~45–50 min |
@@ -61,6 +65,17 @@ A silence of ≥30 min discards the open slot rather than publishing it late.
 }
 ```
 
+### CALIBRATING (added 2026-09-28)
+
+v7 is *cuff + morphology change since the anchor*; right after a cuff that change is ~0, so the
+first model value is ~the cuff anyway, just 30 min later. So from the first non-flat epoch after
+a cuff, the cuff itself is published as a normal `success` payload with `confidence: "CALIBRATING"`,
+`reading_count: 0`, `estimated_* == reference_*` = the cuff, `alert` as latched (a new cuff clears
+it), `window` = the current slot. At most one per wall-clock slot, and none once the first 15-min
+value (`LOW`) has been published for that cuff. A new cuff restarts it with the new value.
+`V7_CAL_PUBLISH=0` switches it off (back to nothing until the first slot closes). It is the
+measured cuff, not a model output, so it does not touch v7 accuracy.
+
 `status: alert` is emitted on **every** slot while the latch is on. A new cuff (even an identical
 repeat) clears it and rebuilds the anchor.
 
@@ -86,6 +101,7 @@ next to `ref:{adm}` so pods and restarts share it.
 | `V7_ALERT_SBP` / `V7_ALERT_DBP` / `V7_ALERT_PERSIST` | 15 / 10 / 2 | alert rule |
 | `V7_CAP_MMHG` | 25 | max delta from the cuff |
 | `V7_STALE_SEC` | 1800 | silence that discards the open slot |
+| `V7_CAL_PUBLISH` | 1 | publish the cuff as `CALIBRATING` until the first 15-min value (0 = off) |
 
 ## Decisions taken (2026-09-03)
 
@@ -94,7 +110,8 @@ next to `ref:{adm}` so pods and restarts share it.
 - Hb/glucose: legacy engine, `HB_BIAS_G_DL` still applied.
 - Poor/flat epochs inside a slot are dropped, not published. Flat-line handling for the ward
   is the backend's job.
-- No estimate without a cuff. First alert ~1 h after the cuff. Alerts latch until a new cuff.
+- No estimate without a cuff. First alert ~1 h after the cuff. (2026-09-28: the cuff itself is
+  now shown as `CALIBRATING` from ~3 min after it, until the first 15-min value.) Alerts latch until a new cuff.
 - Kept as-is, still temporary: the facility gate (`EBP_ALLOWED_FACILITY`, default
   `CF1315821527` only since 2026-09-05; comma-separate to add, empty to disable) and the Mongo
   shadow sink (`MONGO_SINK_ENABLED`).

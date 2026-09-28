@@ -221,15 +221,28 @@ def run():
               "first slot LOW with no alert; alert fires on the second consecutive breaching slot")
         check(first_alert is not None and all(s[0] == "alert" for s in pubs[first_alert:]),
               "alert stays latched on every following slot")
+        # ---- 5a. a device re-send of the SAME value (new epochTime) is not a new cuff ------
+        anchor_key_before = VS.v7_engine.load_state(ADM)["anchor_key"]
+        t += 60
+        r_dup = VS.process_vitals(cuff(111, 71, t))           # within 5 mmHg of 110/70
+        t += 60
+        r_zero = VS.process_vitals(cuff(0, 0, t))             # "no reading" from the monitor
+        t += 60
+        VS.process_vitals(epoch(eps[1], t))
+        st = VS.v7_engine.load_state(ADM)
+        check(r_dup["status"] == "ignored" and "Duplicate" in r_dup["message"] and r_zero["status"] == "ignored"
+              and VS._ref_read(ADM)["sbp"] == 110 and st["anchor_key"] == anchor_key_before
+              and st["anchor_f"] is not None and st["alert"],
+              "same-value re-send and 0/0 keep the reference, the anchor and the alert")
         # ---- 5. a new cuff clears the latch ---------------------------------------------
         t += 180
-        VS.process_vitals(cuff(112, 72, t))
+        VS.process_vitals(cuff(125, 82, t))
         t += 180
         r = VS.process_vitals(epoch(eps[0], t))
         st = VS.v7_engine.load_state(ADM)
         check(st["alert"] == "" and st["anchor_f"] is None and r.get("confidence") == "CALIBRATING"
-              and r.get("alert") == "" and r["bp"]["estimated_sbp"] == 112,
-              "new cuff clears the alert and starts re-calibration (CALIBRATING 112, no alert)")
+              and r.get("alert") == "" and r["bp"]["estimated_sbp"] == 125,
+              "new cuff clears the alert and starts re-calibration (CALIBRATING 125, no alert)")
     finally:
         VS.v7_engine._ms, VS.v7_engine._md = real_ms, real_md
 

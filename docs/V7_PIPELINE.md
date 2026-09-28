@@ -126,7 +126,12 @@ next to `ref:{adm}` so pods and restarts share it.
 - Kept as-is, still temporary: the facility gate (`EBP_ALLOWED_FACILITY`, default
   `CF1315821527` only since 2026-09-05, `CF1315821527,CF199221737` since 2026-09-28; comma-separate to add, empty to disable) and the Mongo
   shadow sink (`MONGO_SINK_ENABLED`).
-- The cuff path (dedupe of identical re-sends within 15 min) is unchanged. v7 keys the cuff by
+- 2026-09-28 cuff path: `0/0` (or any zero half) is "no reading" and ignored. A non-manual cuff
+  within 5 mmHg of the stored reference is a re-send and keeps the stored reference AND its
+  timestamp (the old 15-min cooldown never fired under v7, so monitors that re-broadcast their
+  last NIBP, e.g. LEPU, rebuilt the anchor on every packet). Consequence: a same-value DEVICE cuff
+  no longer clears an alert; a MANUAL entry, or a changed value, still does.
+- The cuff path (dedupe of identical re-sends within 15 min) was otherwise unchanged. v7 keys the cuff by
   its `epochTime`; a repeat that the dedupe lets through still clears the alert.
 
 ## Test

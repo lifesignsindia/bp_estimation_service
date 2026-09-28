@@ -79,9 +79,20 @@ measured cuff, not a model output, so it does not touch v7 accuracy.
 `status: alert` is emitted on **every** slot while the latch is on. A new cuff (even an identical
 repeat) clears it and rebuilds the anchor.
 
-Per-epoch results (`accumulating`, `poor_signal`, `ignored`, `error`) are still returned by
-`process_vitals` for the consumer's logs and the Mongo shadow sink, but `FORWARD_STATUSES` is
-back to `{"success", "alert"}` so they never reach `vitals.clinical`.
+### Display flag (2026-09-28)
+
+Every result now reaches `vitals.clinical` (`EBP_FORWARD_STATUSES`, default
+`success,alert,accumulating,poor_signal,ignored,error`; set `success,alert` to go back).
+Each payload carries `"display": true|false`:
+
+| status | display | BP keys |
+|---|---|---|
+| `success`, `alert` (incl. `CALIBRATING`) | `true` | `bp.estimated_sbp`, `bp.estimated_dbp` (unchanged) |
+| `accumulating` (per-epoch v7 value, ~every 3 min) | `false` | `bp.Estimated_sbp`, `bp.Estimated_dbp` |
+| `poor_signal`, `ignored`, `error` | `false` | no BP |
+
+The UI reads lowercase `estimated_sbp`, so non-display values are stored by the backend but never
+shown. The rename is done in one place, `process_vitals`, for every non-display result.
 
 ## State
 

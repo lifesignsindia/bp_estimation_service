@@ -12,6 +12,9 @@ Checks
   7. CALIBRATING: from the first epoch after a cuff, the cuff itself is published (confidence
      CALIBRATING) at most once per slot, and never again once the first 15-min value is out;
      a new cuff restarts it with the new value; V7_CAL_PUBLISH=0 switches it off
+  8. display: success/alert carry display=true and bp.estimated_sbp/dbp; every other status
+     (accumulating, poor_signal, ignored, error) carries display=false and its BP only as
+     bp.Estimated_sbp/Estimated_dbp, so the backend can store it without showing it
   3. flat and noisy epochs are dropped from the slot (poor_signal, not published, not counted)
   4. the published payload keeps the legacy shape (bp block, sqi, pleth, Hb/glucose, _meta)
   5. a new cuff rebuilds the anchor and clears any alert
@@ -99,16 +102,18 @@ def run():
     _now = _time.time()
     t0 = _now - (_now % 900) + 30                            # 30 s into the current slot
     t = t0
-    published, statuses, cals = [], [], []
+    published, statuses, cals, allr = [], [], [], []
     first_real_t = None
 
     # ---- 1. cuff, then epochs every 180 s -------------------------------------------------
     r = VS.process_vitals(cuff(120, 80, t))
     check(r["status"] == "ignored", "cuff packet is ignored (stored as reference)")
+    allr.append(r)
     for i in range(30):                                        # 90 minutes of epochs
         t += 180
         r = VS.process_vitals(epoch(eps[i % len(eps)], t))
         statuses.append(r.get("confidence") or r["status"])
+        allr.append(r)
         if r.get("confidence") == "CALIBRATING":
             cals.append((t, r))
         elif r["status"] in ("success", "alert"):
@@ -165,6 +170,24 @@ def run():
     check(r_noise["status"] == "poor_signal", f"noise epoch -> poor_signal (q={r_noise['sqi'].get('v7_quality')})")
     check(len(st_after["win"]) == n_good_before or st_after["win_key"] != st_before["win_key"],
           "dropped epochs did not enter the slot")
+
+    # ---- 8. display flag + Estimated_* on everything that must not be shown ----------------
+    allr += [r_flat, r_noise]
+    check(all(isinstance(x.get("display"), bool) for x in allr), "every result carries a display flag")
+    check(all(x["display"] == (x["status"] in ("success", "alert")) for x in allr),
+          "display=true exactly for success/alert (CALIBRATING included), false for everything else")
+    shown = [x for x in allr if x["display"]]
+    hidden = [x for x in allr if not x["display"]]
+    check(all("estimated_sbp" in x["bp"] and "Estimated_sbp" not in x["bp"] for x in shown),
+          "displayed payloads keep bp.estimated_sbp/dbp")
+    check(not any("estimated_sbp" in (x.get("bp") or {}) or "estimated_dbp" in (x.get("bp") or {}) for x in hidden),
+          "no hidden payload carries bp.estimated_sbp/dbp")
+    acc_vals = [x for x in hidden if x["status"] == "accumulating" and (x.get("bp") or {}).get("Estimated_sbp") is not None]
+    check(len(acc_vals) > 0 and all(isinstance(x["bp"]["Estimated_dbp"], (int, float)) for x in acc_vals),
+          f"per-epoch accumulating values arrive as bp.Estimated_sbp/dbp ({len(acc_vals)} seen)")
+    check({"ignored", "poor_signal", "accumulating"} <= {x["status"] for x in hidden},
+          "ignored, poor_signal and accumulating results are all tagged display=false")
+    print("  sample hidden payload:", json.dumps({k: v for k, v in acc_vals[0].items() if k not in ("pleth", "spo2")})[:400])
 
     # ---- 6. forced alert: +20 mmHg delta from a fresh cuff --------------------------------
     class _Plus:

@@ -383,8 +383,30 @@ def _niso101_pr_from_pr_all(json_data):
             sp["PR"] = int(round(sum(vals) / len(vals)))
 
 
+# Only these statuses are meant to be SHOWN. Everything else still reaches the backend (for
+# logging / audit) but carries display=false and its BP under Estimated_sbp / Estimated_dbp,
+# so a screen reading bp.estimated_sbp never picks up a per-epoch value by accident.
+DISPLAY_STATUSES = {"success", "alert"}
+
+
 def process_vitals(json_data):
-    """Takes JSON, identifies device, routes to DSP, and returns AI predictions."""
+    """Takes JSON, identifies device, routes to DSP, and returns AI predictions.
+    Every result is tagged display=true/false; non-display results have their bp
+    estimated_sbp/estimated_dbp renamed to Estimated_sbp/Estimated_dbp."""
+    result = _process_vitals(json_data)
+    if not isinstance(result, dict):
+        return result                     # None = facility-gated, nothing to emit
+    display = result.get("status") in DISPLAY_STATUSES
+    result["display"] = display
+    bp = result.get("bp")
+    if not display and isinstance(bp, dict):
+        for k in ("sbp", "dbp"):
+            if "estimated_" + k in bp:
+                bp["Estimated_" + k] = bp.pop("estimated_" + k)
+    return result
+
+
+def _process_vitals(json_data):
     adm_id = json_data.get("admissionId") or json_data.get("PatId") or json_data.get("deviceID") or json_data.get("BLEDeviceID", "UNKNOWN_PATIENT")
 
     # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────────

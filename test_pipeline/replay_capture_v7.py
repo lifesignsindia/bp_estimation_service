@@ -166,8 +166,8 @@ def main():
             d = json.loads(m.value())
         except Exception:
             continue
-        if d.get("admissionId") not in want:
-            continue
+        if d.get("admissionId") not in want or not d.get("display", True):
+            continue                       # display=false = per-epoch record, not a published slot
         got.append(d)
         last_rx = time.time()
         if len(got) % 25 == 0:

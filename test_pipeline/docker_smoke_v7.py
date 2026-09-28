@@ -89,8 +89,8 @@ def main():
                 break
             continue
         d = json.loads(m.value())
-        if d.get("admissionId") != ADM:
-            continue
+        if d.get("admissionId") != ADM or not d.get("display", True):
+            continue                       # display=false = per-epoch record, not a shown value
         got.append((time.time(), d))
         bp = d.get("bp", {})
         print("[out] %-7s slot=%s..%s  bp=%s/%s ref=%s/%s  n=%s conf=%s alert=%r hb=%s glu=%s" % (

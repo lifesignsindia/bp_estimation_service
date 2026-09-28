@@ -89,8 +89,8 @@ def main():
                 break
             continue
         d = json.loads(m.value())
-        if d.get("admissionId") != ADM:
-            continue
+        if d.get("admissionId") != ADM or not d.get("display", True):
+            continue                       # display=false = per-epoch record, not a shown value
         got.append((time.time(), d))
         bp = d.get("bp", {})
         print("[out] %-7s slot=%s..%s  bp=%s/%s ref=%s/%s  n=%s conf=%s alert=%r hb=%s glu=%s" % (
@@ -101,7 +101,11 @@ def main():
     slots = len({int(x) // 900 for x in np.arange(now - (now % 900) + 30 + 180 * 7, t + 1, 180)})
     print("[smoke] %d payloads on %s for ~%d slots touched; statuses=%s"
           % (len(got), OUT, slots, sorted({d["status"] for _, d in got})))
-    ok = 1 <= len(got) <= slots and all(d["status"] in ("success", "alert") for _, d in got)
+    model = [d for _, d in got if d.get("confidence") != "CALIBRATING"]
+    cal = [d for _, d in got if d.get("confidence") == "CALIBRATING"]
+    print("[smoke] %d CALIBRATING (cuff value) + %d model payloads" % (len(cal), len(model)))
+    ok = (1 <= len(model) <= slots and all(d["status"] in ("success", "alert") for _, d in got)
+          and len(cal) >= 1 and all(d["bp"].get("estimated_sbp") == 120 for d in cal))
     print("[smoke] " + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

@@ -170,6 +170,14 @@ def run():
             _allowed_set = {f.strip() for f in _allowed_fac.split(",") if f.strip()}
             _fac = _resolve_facility(payload)
             if _fac not in _allowed_set:
+                _gd = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+                _gp = payload.get("pleth") if isinstance(payload.get("pleth"), dict) else {}
+                _gn = max((len(v) for v in _gp.values() if isinstance(v, list)), default=0)
+                print(f"[GATE] dropped | adm={adm_id} | facility={_fac} | "
+                      f"device={_gd.get('deviceName') or payload.get('deviceName') or '-'} | "
+                      f"category={payload.get('category', '-')} | pleth_samples={_gn} | "
+                      f"keys={','.join(sorted(payload.keys()))[:160]}")
+                sys.stdout.flush()
                 continue
 
         # Support both nested and top-level device metadata. Some payloads expose

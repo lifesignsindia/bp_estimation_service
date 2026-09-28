@@ -161,15 +161,23 @@ def run():
         adm_id = payload.get("admissionId", "UNKNOWN")
 
         # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────
-        # Only work for the ls.gncl facility (CF1315821527). Any other facility's
+        # Only work for the allowed facilities (CF1315821527, CF199221737). Any other facility's
         # packet is dropped here — no parsing, no inference, no output produced.
         # Configurable via EBP_ALLOWED_FACILITY; set it empty to disable. REMOVE
         # after the trial.
-        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527")
+        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF199221737")
         if _allowed_fac:
             _allowed_set = {f.strip() for f in _allowed_fac.split(",") if f.strip()}
             _fac = _resolve_facility(payload)
             if _fac not in _allowed_set:
+                _gd = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+                _gp = payload.get("pleth") if isinstance(payload.get("pleth"), dict) else {}
+                _gn = max((len(v) for v in _gp.values() if isinstance(v, list)), default=0)
+                print(f"[GATE] dropped | adm={adm_id} | facility={_fac} | "
+                      f"device={_gd.get('deviceName') or payload.get('deviceName') or '-'} | "
+                      f"category={payload.get('category', '-')} | pleth_samples={_gn} | "
+                      f"keys={','.join(sorted(payload.keys()))[:160]}")
+                sys.stdout.flush()
                 continue
 
         # Support both nested and top-level device metadata. Some payloads expose

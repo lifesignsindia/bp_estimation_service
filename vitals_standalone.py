@@ -449,7 +449,17 @@ def _process_vitals(json_data):
                 "admissionId": adm_id,
                 "message": f"Device error sentinel received ({sys_val}/{dia_val}). Cuff reading ignored."
             }
-        
+
+        # 0/0 (or any missing half) is "no reading", not a cuff. Some monitors (e.g. LEPU)
+        # interleave it with the real value; taking it would wipe the reference and make
+        # every following real value look like a NEW cuff, so v7 would never finish its anchor.
+        if sys_val <= 0 or dia_val <= 0:
+            return {
+                "status": "ignored",
+                "admissionId": adm_id,
+                "message": f"Empty cuff reading ({sys_val}/{dia_val}) ignored; reference unchanged."
+            }
+
         # --- CASE 2: REFERENCE HANDLING ---
         now = time.time()
         session = _session_read(adm_id)
@@ -467,14 +477,19 @@ def _process_vitals(json_data):
         # (Nexus re-broadcasts the same manual reference); this is what prevents the
         # infinite loop of immediate checks and repeated ALERT outputs. A changed or
         # manual reference is always taken.
-        if session and not ref_changed and not _is_manual:
-            last_confirm = session.get("last_confirmation_time", 0)
-            if (now - last_confirm) < 900:
-                return {
-                    "status": "ignored",
-                    "admissionId": adm_id,
-                    "message": f"Duplicate reference ignored (value unchanged, {(now - last_confirm)/60:.1f}m into stability window)."
-                }
+        #
+        # v7: nothing sets last_confirmation_time any more, so that cooldown never fired and
+        # every re-send was re-written with a NEW timestamp — and v7 keys a cuff by its
+        # timestamp, so each re-send rebuilt the anchor and no value was ever published for
+        # monitors that re-broadcast their last NIBP (e.g. LEPU). An unchanged, non-manual
+        # value now keeps the stored reference and its original timestamp.
+        if not ref_changed and not _is_manual and prev_ref.get("sbp", 0) > 0:
+            return {
+                "status": "ignored",
+                "admissionId": adm_id,
+                "message": f"Duplicate reference ignored (value unchanged at {sys_val}/{dia_val}; "
+                           f"reference kept from {prev_ref.get('timestamp')})."
+            }
 
         # Store this as the ground truth for this patient
         _ref_write(adm_id, sys_val, dia_val, json_data.get("epochTime", 0))

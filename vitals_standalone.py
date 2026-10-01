@@ -432,9 +432,12 @@ def _process_vitals(json_data):
     # --- PATHWAY 1: THE BP CUFF (Update Reference Storage) ---
     if device_type == DEVICE_LS06:
         bp_block = json_data.get("bp", {}) or json_data
-        sys_val    = int(bp_block.get("BPSYS",  bp_block.get("bpSystolic",  bp_block.get("BPSystolic",  0))))
-        dia_val    = int(bp_block.get("BPDIA",  bp_block.get("bpDiastolic", bp_block.get("BPDiastolic", 0))))
-        cuff_error = int(bp_block.get("BP_ERROR", 0))
+        # streaming packets carry the bp block with every field null -> treat null as 0
+        # ("no reading"), which the empty-reading check below then ignores
+        _n0 = lambda v: int(v) if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().lstrip("-").isdigit()) else 0
+        sys_val    = _n0(bp_block.get("BPSYS",  bp_block.get("bpSystolic",  bp_block.get("BPSystolic",  0))))
+        dia_val    = _n0(bp_block.get("BPDIA",  bp_block.get("bpDiastolic", bp_block.get("BPDiastolic", 0))))
+        cuff_error = _n0(bp_block.get("BP_ERROR", 0))
 
         if cuff_error != 0:
             return {

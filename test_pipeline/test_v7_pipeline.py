@@ -40,6 +40,9 @@ import vitals_standalone as VS         # noqa: E402
 import bpv4_features as V              # noqa: E402
 import v7_engine as E7                 # noqa: E402
 
+CAL_DEFAULT = E7.CAL_PUBLISH           # what the image ships with (V7_CAL_PUBLISH unset -> off)
+E7.CAL_PUBLISH = True                  # sections 1-7 exercise CALIBRATING; 7b checks it switched off
+
 FAC = "CF1315821527"
 ADM = "ADM_TEST_V7"
 
@@ -93,6 +96,8 @@ def run():
 
     eps = good_epochs(40)
     print(f"[setup] {len(eps)} GOOD real epochs available")
+    if "V7_CAL_PUBLISH" not in os.environ:
+        check(CAL_DEFAULT is False, "CALIBRATING is OFF by default (V7_CAL_PUBLISH unset)")
     assert len(eps) >= 24, "need real NISO101 capture files under ebp_dashboard/pleth_capture"
 
     VS.v7_engine.reset(ADM)
@@ -259,6 +264,7 @@ def run():
               and offs[0]["status"] == "accumulating", "V7_CAL_PUBLISH=0: no CALIBRATING payloads")
     finally:
         E7.CAL_PUBLISH = True
+    E7.CAL_PUBLISH = CAL_DEFAULT
 
     print("\n%d checks failed" % len(fails) if fails else "\nALL CHECKS PASSED")
     return 1 if fails else 0

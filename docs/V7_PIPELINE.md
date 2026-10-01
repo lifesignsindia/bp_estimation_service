@@ -73,7 +73,8 @@ a cuff, the cuff itself is published as a normal `success` payload with `confide
 `reading_count: 0`, `estimated_* == reference_*` = the cuff, `alert` as latched (a new cuff clears
 it), `window` = the current slot. At most one per wall-clock slot, and none once the first 15-min
 value (`LOW`) has been published for that cuff. A new cuff restarts it with the new value.
-`V7_CAL_PUBLISH=0` switches it off (back to nothing until the first slot closes). It is the
+**OFF by default since 2026-10-01** (on QA the repeated cuff value read as a stuck estimate);
+`V7_CAL_PUBLISH=1` switches it back on. It is the
 measured cuff, not a model output, so it does not touch v7 accuracy.
 
 `status: alert` is emitted on **every** slot while the latch is on. A new cuff (even an identical
@@ -112,7 +113,7 @@ next to `ref:{adm}` so pods and restarts share it.
 | `V7_ALERT_SBP` / `V7_ALERT_DBP` / `V7_ALERT_PERSIST` | 15 / 10 / 2 | alert rule |
 | `V7_CAP_MMHG` | 25 | max delta from the cuff |
 | `V7_STALE_SEC` | 1800 | silence that discards the open slot |
-| `V7_CAL_PUBLISH` | 1 | publish the cuff as `CALIBRATING` until the first 15-min value (0 = off) |
+| `V7_CAL_PUBLISH` | 0 | publish the cuff as `CALIBRATING` until the first 15-min value (1 = on) |
 
 ## Decisions taken (2026-09-03)
 

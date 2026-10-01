@@ -56,8 +56,9 @@ STALE_SEC     = int(os.getenv("V7_STALE_SEC", "1800"))        # gap that discard
 STATE_TTL     = int(os.getenv("V7_STATE_TTL", "86400"))       # Redis TTL, same as the cuff ref
 MIN_SAMPLES   = int(os.getenv("V7_MIN_SAMPLES", "1200"))
 # Until the first 15-min value after a cuff, publish the CUFF itself (confidence CALIBRATING) once
-# per wall-clock slot, so the ward sees a BP ~3 min after the cuff instead of ~30. 0 = off.
-CAL_PUBLISH   = os.getenv("V7_CAL_PUBLISH", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# per wall-clock slot. OFF by default since 2026-10-01 (the ward read the repeated cuff value as a
+# stuck estimate); V7_CAL_PUBLISH=1 turns it back on.
+CAL_PUBLISH   = os.getenv("V7_CAL_PUBLISH", "0").strip().lower() not in ("0", "false", "no", "off", "")
 TREND_HIST    = 5                                             # slots kept for the trend field
 
 _CORE = ["aix", "ri", "ipa", "dvp_time", "stiffness_idx"]     # all-NaN together <=> no notch

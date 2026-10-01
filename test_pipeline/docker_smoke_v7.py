@@ -105,7 +105,7 @@ def main():
     cal = [d for _, d in got if d.get("confidence") == "CALIBRATING"]
     print("[smoke] %d CALIBRATING (cuff value) + %d model payloads" % (len(cal), len(model)))
     ok = (1 <= len(model) <= slots and all(d["status"] in ("success", "alert") for _, d in got)
-          and len(cal) >= 1 and all(d["bp"].get("estimated_sbp") == 120 for d in cal))
+          and all(d["bp"].get("estimated_sbp") == 120 for d in cal))   # none unless V7_CAL_PUBLISH=1
     print("[smoke] " + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

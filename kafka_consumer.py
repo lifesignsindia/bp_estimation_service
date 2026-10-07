@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import config as cfg
+import mongo_sink          # no-op unless MONGO_SINK_ENABLED=1
 
 print("[CFG]  ==================== PIPELINE STARTING ====================")
 print("[CFG]  KAFKA_BROKERS      =", cfg.KAFKA_BROKERS)
@@ -35,13 +36,12 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
-# TEMPORARY (ebp-dashboard field test): forward the meaningful per-patient states
-# that normally only go to logs — "accumulating" (interim estimates), "poor_signal"
-# (flat/poor signal) and "error" — so the dashboard can mirror each patient's real
-# state, not just final BP. ("ignored" = device-lock/cooldown housekeeping is left out.)
-# This raises output volume substantially.
-# REVERT after testing → restore to {"success", "alert"}. Safe state: tag `working_pipeline`.
-FORWARD_STATUSES = {"success", "alert", "accumulating", "poor_signal", "error"}
+# Every status reaches the output topic. Only success / alert carry display=true and
+# bp.estimated_sbp/dbp; per-epoch states (accumulating, poor_signal, ignored, error) carry
+# display=false and Estimated_sbp/dbp so the backend stores them without showing them
+# (see process_vitals). EBP_FORWARD_STATUSES narrows it again, e.g. "success,alert".
+FORWARD_STATUSES = {s.strip() for s in os.getenv(
+    "EBP_FORWARD_STATUSES", "success,alert,accumulating,poor_signal,ignored,error").split(",") if s.strip()}
 
 consumer = Consumer({
     "bootstrap.servers":    cfg.KAFKA_BROKERS,
@@ -161,15 +161,23 @@ def run():
         adm_id = payload.get("admissionId", "UNKNOWN")
 
         # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────
-        # Only work for the ls.gncl facility (CF1315821527). Any other facility's
+        # Only work for the allowed facilities (CF1315821527, CF199221737). Any other facility's
         # packet is dropped here — no parsing, no inference, no output produced.
         # Configurable via EBP_ALLOWED_FACILITY; set it empty to disable. REMOVE
         # after the trial.
-        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF557841749,CF1398828720")
+        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF199221737")
         if _allowed_fac:
             _allowed_set = {f.strip() for f in _allowed_fac.split(",") if f.strip()}
             _fac = _resolve_facility(payload)
             if _fac not in _allowed_set:
+                _gd = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+                _gp = payload.get("pleth") if isinstance(payload.get("pleth"), dict) else {}
+                _gn = max((len(v) for v in _gp.values() if isinstance(v, list)), default=0)
+                print(f"[GATE] dropped | adm={adm_id} | facility={_fac} | "
+                      f"device={_gd.get('deviceName') or payload.get('deviceName') or '-'} | "
+                      f"category={payload.get('category', '-')} | pleth_samples={_gn} | "
+                      f"keys={','.join(sorted(payload.keys()))[:160]}")
+                sys.stdout.flush()
                 continue
 
         # Support both nested and top-level device metadata. Some payloads expose
@@ -230,6 +238,12 @@ def run():
                     value=json.dumps(out).encode(),
                     callback=_delivery_cb,
                 )
+                # Mirror the SAME payload into its own MongoDB database. Best-effort and
+                # off unless MONGO_SINK_ENABLED=1; it cannot raise and cannot block the
+                # publish above. Writes to MONGO_SINK_DB (default ebp_shadow), never to
+                # `local`, so no production collection is touched.
+                mongo_sink.write(out, status=status, adm_id=adm_id,
+                                 topic=cfg.KAFKA_OUTPUT_TOPIC)
                 _flush_counter += 1
                 if _flush_counter >= _FLUSH_EVERY:
                     producer.flush(timeout=5)
@@ -237,6 +251,8 @@ def run():
             except Exception as e:
                 print(f"[KAFKA] Produce error: {e}")
                 sys.stdout.flush()
+
+        if status in ("success", "alert"):
             bp = result.get("bp", {})
             print(f"[OUT] {status.upper()} | adm={adm_id} | EBP={bp.get('estimated_sbp','-')}/{bp.get('estimated_dbp','-')}")
             sys.stdout.flush()
@@ -246,7 +262,7 @@ def run():
             bp      = result.get("bp", {})
             elapsed = result.get("elapsed_seconds", "-")
             target  = result.get("target_seconds",  "-")
-            print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} | EBP={bp.get('estimated_sbp','-')}/{bp.get('estimated_dbp','-')}")
+            print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} | EBP={bp.get('Estimated_sbp','-')}/{bp.get('Estimated_dbp','-')} (display=false)")
             sys.stdout.flush()
             _debug("ACCUMULATING", f"{elapsed}/{target}s", adm_id, status)
 

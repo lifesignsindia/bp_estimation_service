@@ -53,6 +53,9 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_TLS: "false"
+      # Replay support: EBP_EPOCH_TS_MAX_SKEW_SEC=315360000 docker compose up -d
+      # lets historical captures keep their own epochTime for 15-min slotting.
+      EBP_EPOCH_TS_MAX_SKEW_SEC: ${EBP_EPOCH_TS_MAX_SKEW_SEC:-86400}
       # Optional for TLS-enabled Redis:
       # REDIS_URL: rediss://<host>:6379
       # REDIS_TLS: "true"

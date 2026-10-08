@@ -7,7 +7,10 @@ Redis connect succeeds against an in-memory store. Real NISO101 epochs from the 
 pleth capture are used so the v7 quality gate sees genuine morphology.
 
 Checks
-  1. a cuff, then epochs every 180 s -> no model value published until a 15-min slot closes
+  1. a cuff, then epochs every 180 s -> no model value published until the anchor is built
+  1b. EARLY first value: once the anchor is built and the open slot has 2 good scored epochs, ONE
+      value is published at once (window.early=true, LOW, no alert), before the slot ends; the
+      slot still publishes its own value at its end, and run / alert counting is unchanged
   2. exactly one success/alert payload per closed slot, none in between
   7. CALIBRATING: from the first epoch after a cuff, the cuff itself is published (confidence
      CALIBRATING) at most once per slot, and never again once the first 15-min value is out;
@@ -145,7 +148,17 @@ def run():
               "bp", "alert", "sqi", "trending", "morphology_change", "window", "pleth", "message", "patientId"):
         check(k in c0, f"CALIBRATING payload has '{k}'")
     n_slots = len({int(s) // 900 for s in np.arange(t0 + 180 * 7, t + 1, 180)})
-    check(1 <= len(published) <= n_slots, f"published {len(published)} payloads for ~{n_slots} slots touched (one per closed slot)")
+    early = [x for x in published if x.get("window", {}).get("early")]
+    slots_pub = [x for x in published if not x.get("window", {}).get("early")]
+    check(len(early) == 1 and published[0] is early[0], "exactly one EARLY value per cuff, and it is the first value")
+    e0 = early[0] if early else {}
+    check(e0.get("confidence") == "LOW" and e0.get("alert") == "" and e0.get("window", {}).get("good_epochs") == 2
+          and "early" in e0.get("message", ""), "early value: LOW, no alert, from exactly 2 good epochs")
+    check(bool(slots_pub) and slots_pub[0]["window"]["start"] == e0["window"]["start"]
+          and slots_pub[0]["confidence"] == "LOW" and slots_pub[0]["window"]["good_epochs"] >= 2,
+          "the same slot still publishes its full value at its end, still LOW (early did not count as a slot)")
+    check(len(slots_pub) >= 2 and slots_pub[1]["confidence"] == "HIGH", "the next slot is HIGH, as before")
+    check(1 <= len(slots_pub) <= n_slots, f"published {len(slots_pub)} slot payloads for ~{n_slots} slots touched (one per closed slot)")
     check(all(st in ("accumulating", "CALIBRATING", "LOW", "HIGH", "poor_signal") for st in statuses),
           "no unexpected statuses")
 
@@ -211,12 +224,16 @@ def run():
             t += 180
             r = VS.process_vitals(epoch(eps[(i + 7) % len(eps)], t))
             first_after = first_after or r
-            seq.append((r["status"], r.get("alert", ""), r.get("confidence", "")))
+            seq.append((r["status"], r.get("alert", ""), r.get("confidence", ""),
+                        bool((r.get("window") or {}).get("early"))))
         st = VS.v7_engine.load_state(ADM)
         check(st["anchor_s"] == 110.0 and st["anchor_f"] is not None, "new cuff rebuilt the anchor at 110/70")
         check(first_after.get("confidence") == "CALIBRATING" and first_after["bp"]["estimated_sbp"] == 110
               and first_after["bp"]["estimated_dbp"] == 70, "a new cuff restarts CALIBRATING with the new cuff 110/70")
-        pubs = [s for s in seq if s[0] in ("success", "alert") and s[2] != "CALIBRATING"]
+        early_after = [s for s in seq if s[3]]
+        check(len(early_after) == 1 and early_after[0][0] == "success" and early_after[0][1] == "",
+              "new cuff: one early value, no alert even with a +20 mmHg delta")
+        pubs = [s[:3] for s in seq if s[0] in ("success", "alert") and s[2] != "CALIBRATING" and not s[3]]
         print("  published after new cuff:", pubs)
         first_alert = next((i for i, s in enumerate(pubs) if s[0] == "alert"), None)
         check(first_alert is not None, "a sustained +20 mmHg delta raises an alert")

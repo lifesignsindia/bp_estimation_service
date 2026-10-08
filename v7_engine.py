@@ -59,6 +59,10 @@ MIN_SAMPLES   = int(os.getenv("V7_MIN_SAMPLES", "1200"))
 # per wall-clock slot. OFF by default since 2026-10-01 (the ward read the repeated cuff value as a
 # stuck estimate); V7_CAL_PUBLISH=1 turns it back on.
 CAL_PUBLISH   = os.getenv("V7_CAL_PUBLISH", "0").strip().lower() not in ("0", "false", "no", "off", "")
+# First value after a cuff: publish as soon as the anchor is built AND the open slot holds
+# MIN_EP_WINDOW good scored epochs, instead of waiting for the slot to end (saves up to 15 min).
+# It does NOT count as a slot (run / alert / trend untouched); the slot still publishes at its end.
+EARLY_FIRST   = os.getenv("V7_EARLY_FIRST", "1").strip().lower() not in ("0", "false", "no", "off", "")
 TREND_HIST    = 5                                             # slots kept for the trend field
 
 _CORE = ["aix", "ri", "ipa", "dvp_time", "stiffness_idx"]     # all-NaN together <=> no notch
@@ -77,6 +81,7 @@ def _fresh_state():
         last_epoch_ts=None, last_value=None, last_value_ts=None,
         hist=[],                      # last TREND_HIST slot medians [sbp, dbp]
         cal_key=None,                 # slot of the last CALIBRATING (cuff-value) publish
+        early_done=False,             # the early first value for this cuff has been published
     )
 
 
@@ -250,7 +255,7 @@ class V7Engine(object):
                          anchor_s=float(ref_sbp), anchor_d=float(ref_dbp or 0),
                          anchor_f=None, buf=[], run=0, hot_run=0,
                          win=[], win_key=None, win_epochs=0, win_first_ts=None,
-                         last_value=None, hist=[], cal_key=None)
+                         last_value=None, hist=[], cal_key=None, early_done=False)
                 print("[V7] new anchor cuff for %s: %s/%s (ref id %s)" % (adm, ref_sbp, ref_dbp, rid))
                 sys.stdout.flush()
         out["alert"] = s["alert"]
@@ -322,6 +327,8 @@ class V7Engine(object):
         if good:
             # unrounded, so the slot median is bit-identical to the dashboard runtime's
             s["win"].append([sbp, dbp, hb, glu])
+        if out["window"] is None:
+            out["window"] = self._maybe_early(s)
         out["alert"] = s["alert"]
         out["trend"] = self.trend(s)
         out["run"] = s["run"]
@@ -334,6 +341,34 @@ class V7Engine(object):
         else:
             out["state"] = "accumulating"
         return self._finish(adm, s, out, ts)
+
+    @staticmethod
+    def _maybe_early(s):
+        """The first value after a cuff, from the open slot so far. Only while nothing has been
+        published for this cuff (hist empty), once per cuff, and only with MIN_EP_WINDOW good
+        epochs. Reads the slot without closing it and leaves run / hot_run / alert / hist alone,
+        so the 15-min schedule and the alert rule are exactly as before."""
+        if not EARLY_FIRST or s.get("early_done") or s["hist"] or s["anchor_f"] is None:
+            return None
+        vals = [v for v in s["win"] if v and v[0] is not None]
+        if len(vals) < MIN_EP_WINDOW:
+            return None
+        s["early_done"] = True
+        sbp = float(np.median([v[0] for v in vals]))
+        dbp = float(np.median([v[1] for v in vals]))
+        hb  = [v[2] for v in vals if isinstance(v[2], (int, float))]
+        glu = [v[3] for v in vals if isinstance(v[3], (int, float))]
+        hot_s = abs(sbp - s["anchor_s"]) >= ALERT_SBP
+        hot_d = abs(dbp - s["anchor_d"]) >= ALERT_DBP
+        return dict(
+            sbp=round(sbp, 1), dbp=round(dbp, 1),
+            hb=(round(float(np.mean(hb)), 1) if hb else None),
+            glucose=(int(round(float(np.mean(glu)))) if glu else None),
+            n_good=len(vals), n_epochs=s["win_epochs"],
+            key=s["win_key"], start=s["win_key"] * WINDOW_SEC, end=(s["win_key"] + 1) * WINDOW_SEC,
+            established=False, hot=hot_s or hot_d, hot_sbp=hot_s, hot_dbp=hot_d,
+            alert=s["alert"], alert_new=False, run=s["run"], early=True,
+        )
 
     @staticmethod
     def _maybe_cal(s, out, ts):

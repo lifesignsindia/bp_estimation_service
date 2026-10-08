@@ -35,6 +35,7 @@ admission, so the pipeline processes every arrival. No throttling is needed.
 |---|---|---|
 | CALIBRATING (the cuff value) | any non-flat epoch after the cuff | ~3 min, then once per slot |
 | anchor | 6 GOOD epochs | ~18 min |
+| **early first value** (`window.early: true`, `LOW`) | anchor built + 2 GOOD scored epochs in the open slot | ~21-25 min (published at once, not at the slot end) |
 | first published value (`confidence: LOW`) | slot with ≥2 GOOD epochs closes | ~30–35 min |
 | established (`confidence: HIGH`) | 2 consecutive counted slots | ~45–50 min |
 | alert | established AND 2 consecutive slots ≥15 sys or ≥10 dia off the cuff, so earliest on the 2nd counted slot | ~45–50 min |
@@ -80,6 +81,15 @@ measured cuff, not a model output, so it does not touch v7 accuracy.
 `status: alert` is emitted on **every** slot while the latch is on. A new cuff (even an identical
 repeat) clears it and rebuilds the anchor.
 
+### Early first value (2026-10-08)
+
+After a cuff, the first value no longer waits for its slot to end: as soon as the anchor is built
+and the open slot holds `V7_MIN_EPOCHS_WINDOW` (2) GOOD scored epochs, their median is published
+once, as a normal `success` with `confidence: "LOW"` and `window.early: true`. It is a real v7
+estimate, not the cuff. It does **not** count as a slot: `run`, the alert rule and the trend are
+untouched, and the same slot still publishes its full value at its end (still `LOW`, then `HIGH`
+on the next slot). One early value per cuff; a new cuff re-arms it. `V7_EARLY_FIRST=0` turns it off.
+
 ### Display flag (2026-09-28)
 
 Every result now reaches `vitals.clinical` (`EBP_FORWARD_STATUSES`, default
@@ -113,6 +123,7 @@ next to `ref:{adm}` so pods and restarts share it.
 | `V7_ALERT_SBP` / `V7_ALERT_DBP` / `V7_ALERT_PERSIST` | 15 / 10 / 2 | alert rule |
 | `V7_CAP_MMHG` | 25 | max delta from the cuff |
 | `V7_STALE_SEC` | 1800 | silence that discards the open slot |
+| `V7_EARLY_FIRST` | 1 | publish the first value after a cuff as soon as the open slot has 2 GOOD scored epochs (0 = wait for the slot end) |
 | `V7_CAL_PUBLISH` | 0 | publish the cuff as `CALIBRATING` until the first 15-min value (1 = on) |
 
 ## Decisions taken (2026-09-03)

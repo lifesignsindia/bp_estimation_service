@@ -591,6 +591,17 @@ def _process_vitals(json_data):
         if 80 <= sensed_hz <= 200:
             actual_hz = sensed_hz
 
+    # NISO101 comes in two hardware variants with the same 18 s epoch: BerryMed (fw V1.x,
+    # 3600 samples = 200 Hz) and the LEPU-made unit (fw "RI…", 2160 samples = 120 Hz).
+    # Read at 200 Hz the 120 Hz waveform is squashed (~6 beats, corr ~0.6) and v7 rejects
+    # every epoch, so calibration never starts. Identify the 120 Hz unit by firmware, or by
+    # its exact 2160-sample packet when the firmware arrives as "Unknown".
+    if device_type == DEVICE_BERRYMED and raw_pleth:
+        _fw = str(((json_data.get("device") or {}) if isinstance(json_data.get("device"), dict) else {})
+                  .get("fwVersion", "")).strip().upper()
+        if _fw.startswith("RI") or len(raw_pleth) == 2160:
+            actual_hz = 120
+
     # 1. Clean and enforce 120Hz
     model_ready_pleth, sqi_info = _preprocess_signal(raw_pleth, actual_hz, 120, device_type)
 

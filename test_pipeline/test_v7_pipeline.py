@@ -199,6 +199,13 @@ def run():
         rq = VS.process_vitals(pk)
         check((rq.get("sqi") or {}).get("v7_quality") == "GOOD",
               f"120 Hz NISO101 ({label}) is read at 120 Hz and passes v7 (q={(rq.get('sqi') or {}).get('v7_quality')})")
+    # a cut-short BerryMed (200 Hz) packet that happens to be 2160 long stays at 200 Hz
+    cut = list(eps[3][:2160])
+    pk = epoch(cut, t + 2); pk["admissionId"] = "ADM_TEST_BERRY_CUT"
+    pk["device"] = {"deviceName": "NISO101", "deviceType": "NISO101", "fwVersion": "Unknown", "macAddress": "00:A0:50:39:7A:02"}
+    rq = VS.process_vitals(pk)
+    check((rq.get("sqi") or {}).get("v7_quality") == "GOOD",
+          f"cut-short BerryMed packet of 2160 samples is still read at 200 Hz (q={(rq.get('sqi') or {}).get('v7_quality')})")
 
     # ---- 8. display flag + Estimated_* on everything that must not be shown ----------------
     allr += [r_flat, r_noise]

@@ -749,8 +749,12 @@ def _process_vitals(json_data):
             sys.stdout.flush()
         else:
             final_status = "success"
-            final_msg = (f"15-minute v7 median ({win['n_good']} good of {win['n_epochs']} epochs, "
-                         f"{'established' if win['established'] else 'first window'}).")
+            if win.get("early"):
+                final_msg = (f"First v7 value (early): median of {win['n_good']} good epochs since "
+                             f"calibration; the full 15-minute value follows at the end of this slot.")
+            else:
+                final_msg = (f"15-minute v7 median ({win['n_good']} good of {win['n_epochs']} epochs, "
+                             f"{'established' if win['established'] else 'first window'}).")
 
         final_payload = {**common,
             "status": final_status,
@@ -771,7 +775,7 @@ def _process_vitals(json_data):
             "morphology_change": morphology,
             "window": {"start": int(win["start"]), "end": int(win["end"]),
                        "good_epochs": win["n_good"], "epochs": win["n_epochs"],
-                       "established": bool(win["established"])},
+                       "established": bool(win["established"]), "early": bool(win.get("early"))},
             "pleth": {"PLETH": pleth_out},
             "message": final_msg
         }

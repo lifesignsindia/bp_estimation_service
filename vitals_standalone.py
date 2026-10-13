@@ -573,8 +573,7 @@ def _process_vitals(json_data):
         return {
             "status": "ignored",
             "admissionId": adm_id,
-            "message": (f"Reference BP for {adm_id} updated to {sys_val}/{dia_val}. v7 re-anchors to it only if it "
-                        f"differs from the current anchor by >=15 systolic or >=10 diastolic.")
+            "message": f"Reference BP for {adm_id} updated to {sys_val}/{dia_val}. AI will use this for calibration."
         }
 
     # --- PATHWAY 2: CONTINUOUS MONITORS (For AI) ---
@@ -807,7 +806,7 @@ def _process_vitals(json_data):
         if win["alert"]:
             final_status = "alert"
             final_msg = (f"v7 alert {win['alert']} {'raised' if win['alert_new'] else 'active'}: "
-                         f"15-min median {sbp}/{dbp} vs anchor cuff {ref_sbp_i}/{ref_dbp_i} "
+                         f"15-min median {sbp}/{dbp} vs cuff {ref_sbp_i}/{ref_dbp_i} "
                          f"(latched until a new cuff).")
             print(f"[ALERT] adm={adm_id} | v7_median={sbp}/{dbp} | cuff={ref_sbp_i}/{ref_dbp_i} | {win['alert']} | new={win['alert_new']}")
             sys.stdout.flush()

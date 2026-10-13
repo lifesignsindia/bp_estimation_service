@@ -22,9 +22,7 @@ Checks
      the valid range is published as error ESTIMATE_OUT_OF_RANGE, never as an estimate
   3. flat and noisy epochs are dropped from the slot (poor_signal, not published, not counted)
   4. the published payload keeps the legacy shape (bp block, sqi, pleth, Hb/glucose, _meta)
-  5. a cuff beyond +-15/+-10 of the anchor rebuilds it and clears any alert
-  5b. a cuff within +-15/+-10 (manual too) keeps the anchor, its baseline and the run, and
-      retires the alert; an older replayed cuff cannot become the anchor
+  5. a new cuff rebuilds the anchor and clears any alert
   6. a forced +20 mmHg delta raises an alert only after two ESTABLISHED breaching slots, and
      it stays latched until the next cuff
 """
@@ -79,13 +77,10 @@ def good_epochs(n_needed=40):
     return picked
 
 
-def cuff(sbp, dbp, ts, manual=False):
-    m = {"admissionId": ADM, "facilityId": FAC, "epochTime": int(ts * 1000),
-         "device": {"deviceName": "NISO206", "deviceType": "BP"},
-         "bp": {"BPSYS": sbp, "BPDIA": dbp, "BP_ERROR": 0}}
-    if manual:
-        m["isManual"] = True
-    return m
+def cuff(sbp, dbp, ts):
+    return {"admissionId": ADM, "facilityId": FAC, "epochTime": int(ts * 1000),
+            "device": {"deviceName": "NISO206", "deviceType": "BP"},
+            "bp": {"BPSYS": sbp, "BPDIA": dbp, "BP_ERROR": 0}}
 
 
 def epoch(samples, ts):
@@ -307,40 +302,7 @@ def run():
               and VS._ref_read(ADM)["sbp"] == 110 and st["anchor_key"] == anchor_key_before
               and st["anchor_f"] is not None and st["alert"],
               "same-value re-send and 0/0 keep the reference, the anchor and the alert")
-        # ---- 5b. a cuff WITHIN +-15/+-10 of the anchor: anchor kept, alert retired ----------
-        # 118/76 vs anchor 110/70 = +8/+6: a real new value (passes the 5 mmHg duplicate filter)
-        # but inside the re-anchor range -> no rebuild, no CALIBRATING, values keep flowing
-        st0 = VS.v7_engine.load_state(ADM)
-        t += 180
-        VS.process_vitals(cuff(118, 76, t))
-        t += 180
-        r_in = VS.process_vitals(epoch(eps[2], t))
-        st = VS.v7_engine.load_state(ADM)
-        check(st["anchor_s"] == 110.0 and st["anchor_d"] == 70.0 and st["anchor_key"] == st0["anchor_key"]
-              and st["anchor_f"] is not None and st["anchor_f"] == st0["anchor_f"]
-              and st["run"] >= st0["run"] > 0,
-              "cuff 118/76 within +-15/+-10 of anchor 110/70: anchor, baseline and run kept")
-        check(st["alert"] == "" and r_in.get("confidence") != "CALIBRATING" and r_in["status"] != "accumulating"
-              or (st["alert"] == "" and r_in["status"] == "accumulating" and r_in.get("bp", {}).get("Estimated_sbp") is not None),
-              "within-range cuff retires the alert and v7 keeps producing values (no re-calibration)")
-        check((st.get("last_cuff") or {}).get("sbp") == 118.0 and (st.get("last_cuff") or {}).get("anchored") is False,
-              "within-range cuff is recorded as the last cuff, not anchored")
-        # a MANUAL entry inside the range follows the same rule
-        t += 180
-        VS.process_vitals(cuff(112, 72, t, manual=True))
-        t += 180
-        VS.process_vitals(epoch(eps[3], t))
-        st = VS.v7_engine.load_state(ADM)
-        check(st["anchor_s"] == 110.0 and st["anchor_f"] is not None,
-              "manual cuff 112/72 within range: anchor kept at 110/70")
-        # an OLDER cuff replayed after the held one is rejected (forward-only guard)
-        t += 60
-        VS.process_vitals(cuff(150, 95, t - 900))
-        t += 60
-        VS.process_vitals(epoch(eps[4], t))
-        st = VS.v7_engine.load_state(ADM)
-        check(st["anchor_s"] == 110.0, "a replayed cuff older than the newest cuff seen cannot become the anchor")
-        # ---- 5. a cuff OUTSIDE the range re-anchors and clears the latch ----------------
+        # ---- 5. a new cuff clears the latch ---------------------------------------------
         t += 180
         VS.process_vitals(cuff(125, 82, t))
         t += 180

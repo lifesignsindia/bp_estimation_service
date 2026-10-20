@@ -98,12 +98,27 @@ Each payload carries `"display": true|false`:
 
 | status | display | BP keys |
 |---|---|---|
-| `success`, `alert` (incl. `CALIBRATING`) | `true` | `bp.estimated_sbp`, `bp.estimated_dbp` (unchanged) |
-| `accumulating` (per-epoch v7 value, ~every 3 min) | `false` | `bp.Estimated_sbp`, `bp.Estimated_dbp` |
-| `poor_signal`, `ignored`, `error` | `false` | no BP |
+| `success`, `alert` (incl. `CALIBRATING`) | `true` | `bp.estimated_sbp`, `bp.estimated_dbp`, `bp.estimated_map` (integers) |
+| `accumulating`, `poor_signal`, `ignored`, `error` | `false` | no estimated BP |
 
-The UI reads lowercase `estimated_sbp`, so non-display values are stored by the backend but never
-shown. The rename is done in one place, `process_vitals`, for every non-display result.
+### Output contract (2026-10-20, backend integration review)
+
+- **The output is the input packet plus our fields.** Every input field keeps its name and value
+  (facilityId, patientId, the original `pleth` block, a cuff packet's `bp` block, unknown fields).
+  `deviceName` / `deviceType` / `timestamp` are only added when the input lacks them. In the `bp`
+  block only `estimated_sbp/dbp/map` are ours; any input bp field wins over our other bp fields.
+  NISO101 packets still get `spo2.PR` added (mean of `PR_ALL`).
+- **Estimates only on display packets**, so `bp.estimated_sbp > 0` alone identifies an estimate.
+  Values are integers; `estimated_map = round((sbp + 2*dbp) / 3)`.
+- **Range check.** A display estimate outside SBP 40-300 / DBP 20-200, or with SBP <= DBP, becomes
+  `status: error`, `error_code: ESTIMATE_OUT_OF_RANGE` (env `EBP_EST_SBP_MIN/MAX`, `EBP_EST_DBP_MIN/MAX`).
+- **`error_code`** on every packet: `null` for success, alert, accumulating and an accepted cuff;
+  otherwise one of `CUFF_HW_ERROR`, `CUFF_SENTINEL`, `CUFF_EMPTY`, `CUFF_DUPLICATE`,
+  `UNKNOWN_DEVICE`, `DEVICE_LOCKED`, `POOR_SIGNAL`, `FLAT_SIGNAL`, `SIGNAL_TOO_SHORT`,
+  `NO_REFERENCE_CUFF`, `EPOCH_REJECTED`, `INFERENCE_FAILED`, `ESTIMATE_OUT_OF_RANGE`.
+  `message` stays as human-readable detail.
+
+All of it is applied in one place, `process_vitals`.
 
 ## State
 

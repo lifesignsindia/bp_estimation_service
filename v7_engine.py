@@ -23,7 +23,16 @@ MODEL
     v7 is a DELTA model: median(features in slot) - median(features right after the cuff)
     -> +-25 mmHg change on top of the live cuff. Without a cuff there is no estimate. Only
     GOOD epochs (beats >= 10, template corr >= 0.90, dicrotic notch found) build the anchor or
-    enter a window. Trained on MIMIC (19 patients, 464 pairs); day-5 blind run on CIMS caught
+    enter a window.
+
+ANCHOR RULE (2026-10-12)
+    A new cuff re-anchors ONLY if it differs from the anchor held by >= 15 systolic or >= 10
+    diastolic (V7_REANCHOR_SBP / V7_REANCHOR_DBP), manual entries included. A cuff inside that
+    range keeps the anchor, its learned baseline and the 15-min run (no re-calibration gap), but
+    it is still a fresh measurement: it retires a latched alert and restarts the breach count.
+    The newest cuff seen, anchored or not, is the forward-only limit for stale replays.
+
+    Trained on MIMIC (19 patients, 464 pairs); day-5 blind run on CIMS caught
     5 of 8 real moves 1.5-5.2 h early at 50% precision. See docs/V7_PIPELINE.md.
 
 Everything here is best-effort against Redis: a store failure degrades to "no state", never an
@@ -63,6 +72,13 @@ CAL_PUBLISH   = os.getenv("V7_CAL_PUBLISH", "0").strip().lower() not in ("0", "f
 # MIN_EP_WINDOW good scored epochs, instead of waiting for the slot to end (saves up to 15 min).
 # It does NOT count as a slot (run / alert / trend untouched); the slot still publishes at its end.
 EARLY_FIRST   = os.getenv("V7_EARLY_FIRST", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# Re-anchor rule: a new cuff moves the anchor ONLY if it differs from the anchor held by
+# >= V7_REANCHOR_SBP systolic or >= V7_REANCHOR_DBP diastolic. A cuff inside that range is still
+# a fresh measurement - it retires a latched alert - but the anchor, its learned baseline and the
+# 15-min run are kept, so v7 keeps publishing without a re-calibration gap. Applies to manual
+# entries too. V7_REANCHOR_SBP=0 and V7_REANCHOR_DBP=0 restore "every cuff re-anchors".
+REANCHOR_SBP  = float(os.getenv("V7_REANCHOR_SBP", "15"))
+REANCHOR_DBP  = float(os.getenv("V7_REANCHOR_DBP", "10"))
 TREND_HIST    = 5                                             # slots kept for the trend field
 
 _CORE = ["aix", "ri", "ipa", "dvp_time", "stiffness_idx"]     # all-NaN together <=> no notch
@@ -78,6 +94,8 @@ def _fresh_state():
         run=0, n_windows=0,           # consecutive counted slots; total counted slots
         hot_run=0, alert="", alert_since=None, alert_win=None,
         last_ref_id=None,
+        last_ref_ts=None,             # newest cuff seen, anchored or not (forward-only guard)
+        last_cuff=None,               # newest cuff seen: dict(sbp, dbp, ts, anchored)
         last_epoch_ts=None, last_value=None, last_value_ts=None,
         hist=[],                      # last TREND_HIST slot medians [sbp, dbp]
         cal_key=None,                 # slot of the last CALIBRATING (cuff-value) publish
@@ -236,31 +254,50 @@ class V7Engine(object):
         # ---- reference bookkeeping (prototype FIX 5 / FIX 7b) ------------------------------
         have_ref = isinstance(ref_sbp, (int, float)) and ref_sbp > 0
         new_ts = ref_ts if (isinstance(ref_ts, (int, float)) and ref_ts > 0) else None
-        stale = (have_ref and new_ts is not None and s["anchor_ts"] is not None
-                 and new_ts < s["anchor_ts"])
+        # forward-only: compare with the newest cuff SEEN, not only the anchor - a cuff held
+        # inside the re-anchor range is newer than the anchor, and an older replay must not
+        # slip in between and become the anchor
+        newest = max([x for x in (s["anchor_ts"], s.get("last_ref_ts")) if x is not None], default=None)
+        stale = (have_ref and new_ts is not None and newest is not None and new_ts < newest)
         if stale:
-            print("[V7] stale reference REJECTED for %s: %s/%s @%d older than anchor %s/%s @%d"
-                  % (adm, ref_sbp, ref_dbp, new_ts, s["anchor_s"], s["anchor_d"], s["anchor_ts"]))
+            print("[V7] stale reference REJECTED for %s: %s/%s @%d older than the newest cuff @%d "
+                  "(anchor %s/%s)" % (adm, ref_sbp, ref_dbp, new_ts, newest, s["anchor_s"], s["anchor_d"]))
             sys.stdout.flush()
         if have_ref and not stale:
             rid = self._ref_key(new_ts, ref_sbp, ref_dbp)
-            if rid != s["last_ref_id"]:
-                # any genuinely NEW cuff (even an identical repeat) retires the alert
+            if rid != s["last_ref_id"] and rid != s["anchor_key"]:
+                # a genuinely NEW cuff (even an identical repeat): it retires the alert either way
                 s["alert"], s["alert_since"], s["alert_win"] = "", None, None
                 s["last_ref_id"] = rid
-            if rid != s["anchor_key"]:
-                # a new cuff: rebuild the model anchor from scratch, drop the open slot — it
-                # belonged to the old anchor (prototype FIX 3)
-                s.update(anchor_key=rid, anchor_ts=new_ts,
-                         anchor_s=float(ref_sbp), anchor_d=float(ref_dbp or 0),
-                         anchor_f=None, buf=[], run=0, hot_run=0,
-                         win=[], win_key=None, win_epochs=0, win_first_ts=None,
-                         last_value=None, hist=[], cal_key=None, early_done=False)
-                print("[V7] new anchor cuff for %s: %s/%s (ref id %s)" % (adm, ref_sbp, ref_dbp, rid))
+                if new_ts is not None:
+                    s["last_ref_ts"] = new_ts
+                d_s = float(ref_sbp) - s["anchor_s"] if s["anchor_s"] is not None else None
+                d_d = float(ref_dbp or 0) - s["anchor_d"] if s["anchor_d"] is not None else None
+                outside = (s["anchor_key"] is None
+                           or abs(d_s) >= REANCHOR_SBP or abs(d_d) >= REANCHOR_DBP)
+                s["last_cuff"] = dict(sbp=float(ref_sbp), dbp=float(ref_dbp or 0), ts=new_ts,
+                                      anchored=bool(outside))
+                if outside:
+                    # first cuff, or outside the range: rebuild the model anchor from scratch and
+                    # drop the open slot - it belonged to the old anchor (prototype FIX 3)
+                    s.update(anchor_key=rid, anchor_ts=new_ts,
+                             anchor_s=float(ref_sbp), anchor_d=float(ref_dbp or 0),
+                             anchor_f=None, buf=[], run=0, hot_run=0,
+                             win=[], win_key=None, win_epochs=0, win_first_ts=None,
+                             last_value=None, hist=[], cal_key=None, early_done=False)
+                    print("[V7] new anchor cuff for %s: %s/%s (ref id %s)" % (adm, ref_sbp, ref_dbp, rid))
+                else:
+                    # inside the range: keep the anchor, its baseline, the open slot and the run;
+                    # restart the breach count so a retired alert needs 2 fresh breaching slots
+                    s["hot_run"] = 0
+                    print("[V7] cuff %s/%s for %s within +-%g/+-%g of anchor %s/%s (%+.0f/%+.0f) - "
+                          "anchor KEPT, alert retired" % (ref_sbp, ref_dbp, adm, REANCHOR_SBP, REANCHOR_DBP,
+                                                          s["anchor_s"], s["anchor_d"], d_s, d_d))
                 sys.stdout.flush()
         out["alert"] = s["alert"]
         if s["anchor_key"] is not None:
-            out["anchor"] = dict(sbp=s["anchor_s"], dbp=s["anchor_d"], key=s["anchor_key"], ts=s["anchor_ts"])
+            out["anchor"] = dict(sbp=s["anchor_s"], dbp=s["anchor_d"], key=s["anchor_key"], ts=s["anchor_ts"],
+                                 last_cuff=s.get("last_cuff"))
 
         # ---- a long silence discards the open slot instead of publishing it late ----------
         if s["last_epoch_ts"] is not None and ts - s["last_epoch_ts"] >= STALE_SEC and s["win_key"] is not None:

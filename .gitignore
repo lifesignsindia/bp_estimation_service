@@ -80,3 +80,6 @@ _archive/data_dumps/root_ebp_readings.db
 # the v7 engine needs these two JSON files at runtime — keep them despite *.json above
 !models/v7/v7_manifest.json
 !models/v7/feature_medians.json
+
+# external data dump (large, regenerate with model_lab/build_dump.py)
+dump/

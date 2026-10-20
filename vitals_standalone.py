@@ -383,13 +383,15 @@ def _niso101_pr_from_pr_all(json_data):
             sp["PR"] = int(round(sum(vals) / len(vals)))
 
 
-# Only these statuses carry a BP estimate meant to be SHOWN. Every other status still reaches the
-# backend (for logging / audit) with display=false and NO estimated BP at all, so the backend can
-# identify an estimate packet by bp.estimated_sbp > 0 alone.
+# Only these statuses carry a BP estimate meant to be SHOWN, as lowercase bp.estimated_*. Every
+# other status still reaches the backend (for storage / audit) with display=false; when it has a
+# per-epoch value (accumulating) that value goes under capital-E bp.Estimated_*, so a reader of
+# bp.estimated_sbp (exact, case-sensitive) never shows it.
 DISPLAY_STATUSES = {"success", "alert"}
 
-# The estimate keys in the bp block. Always integers, only on display packets.
+# The estimate keys in the bp block. Always integers.
 _EST_KEYS = ("estimated_sbp", "estimated_dbp", "estimated_map")
+_HIDDEN_EST_KEYS = ("Estimated_sbp", "Estimated_dbp", "Estimated_map")
 
 # Top-level keys this service owns. Every other key in the output is the input packet's own field,
 # passed through exactly as received; ours are only added when the input does not have them.
@@ -417,24 +419,23 @@ def process_vitals(json_data):
     The output is the INPUT packet with our fields added: every input field keeps its name and
     value, and in the bp block only estimated_sbp / estimated_dbp / estimated_map are ours to set.
     Every result carries display (true only for success/alert) and error_code (null unless
-    something went wrong or the packet was ignored). Estimates appear only on display packets,
-    as integers, and only when inside the physiological range."""
+    something went wrong or the packet was ignored). Estimates are integers with a MAP, and only
+    sent when inside the physiological range: lowercase estimated_* on success/alert, capital-E
+    Estimated_* on every other status that has a value (accumulating)."""
     result = _process_vitals(json_data)
     if not isinstance(result, dict):
         return result                     # None = facility-gated, nothing to emit
     bp = dict(result.pop("bp", None) or {})
-    if result.get("status") in DISPLAY_STATUSES:
-        s, d = bp.get("estimated_sbp"), bp.get("estimated_dbp")
-        if _estimate_valid(s, d):
-            s, d = int(round(s)), int(round(d))
-            bp["estimated_sbp"], bp["estimated_dbp"] = s, d
-            bp["estimated_map"] = int(round((s + 2 * d) / 3))
-        else:
-            result.update(status="error", error_code="ESTIMATE_OUT_OF_RANGE",
-                          message=f"Estimate {s}/{d} outside the valid range; not published.")
-    if result.get("status") not in DISPLAY_STATUSES:
-        for k in _EST_KEYS:
-            bp.pop(k, None)
+    s, d = bp.pop("estimated_sbp", None), bp.pop("estimated_dbp", None)
+    bp.pop("estimated_map", None)
+    valid = _estimate_valid(s, d)
+    if result.get("status") in DISPLAY_STATUSES and not valid:
+        result.update(status="error", error_code="ESTIMATE_OUT_OF_RANGE",
+                      message=f"Estimate {s}/{d} outside the valid range; not published.")
+    elif valid:
+        s, d = int(round(s)), int(round(d))
+        keys = _EST_KEYS if result.get("status") in DISPLAY_STATUSES else _HIDDEN_EST_KEYS
+        bp.update(zip(keys, (s, d, int(round((s + 2 * d) / 3)))))
     result["display"] = result.get("status") in DISPLAY_STATUSES
     result.setdefault("error_code", None)
 
@@ -445,7 +446,7 @@ def process_vitals(json_data):
     in_bp = json_data.get("bp")
     if bp:
         if isinstance(in_bp, dict):       # input bp fields win; only the estimates are ours
-            bp = {**bp, **in_bp, **{k: bp[k] for k in _EST_KEYS if k in bp}}
+            bp = {**bp, **in_bp, **{k: bp[k] for k in _EST_KEYS + _HIDDEN_EST_KEYS if k in bp}}
         out["bp"] = bp
     return out
 

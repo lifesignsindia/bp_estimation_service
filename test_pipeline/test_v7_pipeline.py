@@ -18,8 +18,10 @@ Checks
   8. output contract: every result is the INPUT packet with our fields added (no input field
      renamed or changed, facilityId kept on cuff packets too) and carries display + error_code;
      success/alert carry display=true and integer bp.estimated_sbp/dbp/map (map = (s+2d)/3);
-     every other status carries display=false and no estimated BP at all; an estimate outside
-     the valid range is published as error ESTIMATE_OUT_OF_RANGE, never as an estimate
+     every other status carries display=false and never a lowercase estimate; accumulating
+     carries its per-epoch value as integer bp.Estimated_sbp/dbp/map (capital E) for storage;
+     an estimate outside the valid range is published as error ESTIMATE_OUT_OF_RANGE and is
+     never sent under either casing
   3. flat and noisy epochs are dropped from the slot (poor_signal, not published, not counted)
   4. the published payload keeps the legacy shape (bp block, sqi, pleth, Hb/glucose, _meta)
   5. a new cuff rebuilds the anchor and clears any alert
@@ -225,8 +227,14 @@ def run():
           "displayed payloads carry integer bp.estimated_sbp/dbp/map > 0")
     check(all(x["bp"]["estimated_map"] == int(round((x["bp"]["estimated_sbp"] + 2 * x["bp"]["estimated_dbp"]) / 3))
               for x in shown), "estimated_map = (sbp + 2*dbp) / 3")
-    check(not any(k.lower().startswith("estimated_") for x in hidden for k in (x.get("bp") or {})),
-          "no hidden payload carries any estimated BP key (any casing)")
+    check(not any(k.startswith("estimated_") for x in hidden for k in (x.get("bp") or {})),
+          "no hidden payload carries a lowercase bp.estimated_* key")
+    acc_vals = [x for x in hidden if x["status"] == "accumulating" and "Estimated_sbp" in (x.get("bp") or {})]
+    check(len(acc_vals) > 0 and all(all(isinstance(x["bp"].get(k), int) and x["bp"][k] > 0
+                                        for k in ("Estimated_sbp", "Estimated_dbp", "Estimated_map")) for x in acc_vals),
+          f"accumulating values arrive as integer bp.Estimated_sbp/dbp/map ({len(acc_vals)} seen)")
+    check(not any(k.startswith("Estimated_") for x in hidden if x["status"] != "accumulating" for k in (x.get("bp") or {})),
+          "ignored / poor_signal / error carry no BP value")
     check({"ignored", "poor_signal", "accumulating"} <= {x["status"] for x in hidden},
           "ignored, poor_signal and accumulating results are all tagged display=false")
     check(all(x.get("facilityId") == FAC and x.get("patientId") == "P1" and x.get("seqNum") == 1
@@ -250,7 +258,7 @@ def run():
         bad = [VS.process_vitals(epoch(eps[i % len(eps)], t + 6 + i)) for i in range(2)]
     finally:
         VS._EST_SBP_RANGE = _orig_lo
-    check(not any(x["display"] or any(k.startswith("estimated_") for k in (x.get("bp") or {})) for x in bad),
+    check(not any(x["display"] or any(k.lower().startswith("estimated_") for k in (x.get("bp") or {})) for x in bad),
           "an out-of-range estimate is never published as an estimate")
 
     # ---- 6. forced alert: +20 mmHg delta from a fresh cuff --------------------------------

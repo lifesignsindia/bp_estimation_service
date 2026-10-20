@@ -99,7 +99,11 @@ Each payload carries `"display": true|false`:
 | status | display | BP keys |
 |---|---|---|
 | `success`, `alert` (incl. `CALIBRATING`) | `true` | `bp.estimated_sbp`, `bp.estimated_dbp`, `bp.estimated_map` (integers) |
-| `accumulating`, `poor_signal`, `ignored`, `error` | `false` | no estimated BP |
+| `accumulating` (per-epoch v7 value, ~every 3 min) | `false` | `bp.Estimated_sbp`, `bp.Estimated_dbp`, `bp.Estimated_map` (capital E, integers) |
+| `poor_signal`, `ignored`, `error` | `false` | no estimated BP |
+
+The two casings are deliberate: the backend shows only lowercase `estimated_*` (exact,
+case-sensitive match) and stores capital-E `Estimated_*` without showing it.
 
 ### Output contract (2026-10-20, backend integration review)
 
@@ -108,8 +112,9 @@ Each payload carries `"display": true|false`:
   `deviceName` / `deviceType` / `timestamp` are only added when the input lacks them. In the `bp`
   block only `estimated_sbp/dbp/map` are ours; any input bp field wins over our other bp fields.
   NISO101 packets still get `spo2.PR` added (mean of `PR_ALL`).
-- **Estimates only on display packets**, so `bp.estimated_sbp > 0` alone identifies an estimate.
-  Values are integers; `estimated_map = round((sbp + 2*dbp) / 3)`.
+- **Lowercase estimates only on display packets**, so `bp.estimated_sbp > 0` (case-sensitive)
+  identifies a shown estimate. Accumulating packets carry `bp.Estimated_*` for storage. All
+  values are integers; MAP = `round((sbp + 2*dbp) / 3)`.
 - **Range check.** A display estimate outside SBP 40-300 / DBP 20-200, or with SBP <= DBP, becomes
   `status: error`, `error_code: ESTIMATE_OUT_OF_RANGE` (env `EBP_EST_SBP_MIN/MAX`, `EBP_EST_DBP_MIN/MAX`).
 - **`error_code`** on every packet: `null` for success, alert, accumulating and an accepted cuff;

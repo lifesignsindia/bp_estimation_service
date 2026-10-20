@@ -38,7 +38,8 @@ except Exception as e:
 
 # Every status reaches the output topic. Only success / alert carry display=true and
 # bp.estimated_sbp/dbp/map; per-epoch states (accumulating, poor_signal, ignored, error) carry
-# display=false and no estimated BP, so the backend stores them without showing them
+# display=false; accumulating carries its per-epoch value as capital-E bp.Estimated_sbp/dbp/map,
+# so the backend stores it without showing it
 # (see process_vitals). EBP_FORWARD_STATUSES narrows it again, e.g. "success,alert".
 FORWARD_STATUSES = {s.strip() for s in os.getenv(
     "EBP_FORWARD_STATUSES", "success,alert,accumulating,poor_signal,ignored,error").split(",") if s.strip()}
@@ -261,7 +262,8 @@ def run():
         elif status == "accumulating":
             elapsed = result.get("elapsed_seconds", "-")
             target  = result.get("target_seconds",  "-")
-            print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} (display=false)")
+            bp      = result.get("bp", {})
+            print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} | EBP={bp.get('Estimated_sbp','-')}/{bp.get('Estimated_dbp','-')} (display=false)")
             sys.stdout.flush()
             _debug("ACCUMULATING", f"{elapsed}/{target}s", adm_id, status)
 

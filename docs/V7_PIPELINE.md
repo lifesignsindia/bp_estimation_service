@@ -123,6 +123,15 @@ case-sensitive match) and stores capital-E `Estimated_*` without showing it.
   `NO_REFERENCE_CUFF`, `EPOCH_REJECTED`, `INFERENCE_FAILED`, `ESTIMATE_OUT_OF_RANGE`.
   `message` stays as human-readable detail.
 
+- **Null on error.** On `poor_signal` (incl. flat signal), any `error`, or a device SpO2 / PR error
+  in the spo2 block (`spo2Error`/`SPO2_ERROR` non-zero, or `spo2ErrorMsg` / `prErrorMsg` not a
+  `*_VALID` message, e.g. `SPO2_UNKNOWN_ERROR`, `PR_INVALID_DATA`), the packet carries SpO2, PR
+  (`spo2`/`pulseRate`, or `SPO2`/`PR`) and `bp.estimated_sbp/dbp/map` as JSON `null`, keys present
+  even when the device dropped them; accumulating `Estimated_*` are nulled too. Cuff readings are
+  never touched and no spo2 block is invented. Such a packet has `display: false`; when it had no
+  error_code it gets `SPO2_INVALID`, `PR_INVALID` or `SPO2_PR_INVALID` (this includes a 15-min
+  success/alert packet, whose estimate is then null).
+
 All of it is applied in one place, `process_vitals`.
 
 ## State

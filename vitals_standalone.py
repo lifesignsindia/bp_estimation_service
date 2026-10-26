@@ -406,6 +406,64 @@ _EST_SBP_RANGE = (float(os.getenv("EBP_EST_SBP_MIN", "40")), float(os.getenv("EB
 _EST_DBP_RANGE = (float(os.getenv("EBP_EST_DBP_MIN", "20")), float(os.getenv("EBP_EST_DBP_MAX", "200")))
 
 
+# Device SpO2 / PR error flags inside the spo2 block (Mongo spelling, then live-socket spelling).
+_SPO2_ERR_KEYS, _SPO2_MSG_KEYS = ("spo2Error", "SPO2_ERROR"), ("spo2ErrorMsg", "SPO2_ERROR_MSG", "sp2ErrorMsg")
+_PR_ERR_KEYS, _PR_MSG_KEYS = ("prError", "PR_ERROR"), ("prErrorMsg", "PR_ERROR_MSG")
+_OK_MSGS = {"", "NONE", "NO ERROR", "NO_ERROR", "OK"}
+# Statuses whose packet must not carry a SpO2, PR or estimated BP value.
+_NULL_STATUSES = {"poor_signal", "error"}
+
+
+def _device_flagged(block, err_keys, msg_keys):
+    """True when the device marks this reading invalid: a non-zero error number, or an error
+    message that is not a *_VALID / no-error message (e.g. SPO2_UNKNOWN_ERROR, PR_INVALID_DATA)."""
+    for k in err_keys:
+        v = block.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v != 0:
+            return True
+    for k in msg_keys:
+        v = block.get(k)
+        if isinstance(v, str):
+            m = v.strip().upper()
+            if m not in _OK_MSGS and not m.endswith("_VALID"):
+                return True
+    return False
+
+
+def _null_on_error(out):
+    """On poor signal, flat signal, any error, or a device SpO2 / PR error, send SpO2, PR and the
+    estimated BP as null instead of leaving them out or sending a value. Cuff readings are never
+    touched. A packet nulled this way is never displayed."""
+    sp = out.get("spo2") if isinstance(out.get("spo2"), dict) else None
+    bad_spo2 = sp is not None and _device_flagged(sp, _SPO2_ERR_KEYS, _SPO2_MSG_KEYS)
+    bad_pr = sp is not None and _device_flagged(sp, _PR_ERR_KEYS, _PR_MSG_KEYS)
+    if not (bad_spo2 or bad_pr or out.get("status") in _NULL_STATUSES):
+        return out
+    if sp is not None:
+        sp = dict(sp)
+        upper = any(k in sp for k in ("SPO2", "PR", "PR_ALL", "SPO2_ERROR"))
+        for k in ("spo2", "SPO2", "pulseRate", "PR"):
+            if k in sp:
+                sp[k] = None
+        sp.setdefault("SPO2" if upper else "spo2", None)
+        sp.setdefault("PR" if upper else "pulseRate", None)
+        out["spo2"] = sp
+    bp = dict(out["bp"]) if isinstance(out.get("bp"), dict) else {}
+    for k in _HIDDEN_EST_KEYS:
+        if k in bp:
+            bp[k] = None
+    bp.update(dict.fromkeys(_EST_KEYS))
+    out["bp"] = bp
+    out["display"] = False
+    if out.get("error_code") is None:
+        out["error_code"] = ("SPO2_PR_INVALID" if bad_spo2 and bad_pr
+                             else "SPO2_INVALID" if bad_spo2 else "PR_INVALID")
+        out["message"] = (f"{out.get('message', '')} Device reported "
+                          f"{'SpO2 and PR' if bad_spo2 and bad_pr else 'SpO2' if bad_spo2 else 'PR'} "
+                          f"invalid; SpO2, PR and estimated BP sent as null.").strip()
+    return out
+
+
 def _estimate_valid(sbp, dbp):
     if not isinstance(sbp, (int, float)) or not isinstance(dbp, (int, float)):
         return False
@@ -421,7 +479,8 @@ def process_vitals(json_data):
     Every result carries display (true only for success/alert) and error_code (null unless
     something went wrong or the packet was ignored). Estimates are integers with a MAP, and only
     sent when inside the physiological range: lowercase estimated_* on success/alert, capital-E
-    Estimated_* on every other status that has a value (accumulating)."""
+    Estimated_* on every other status that has a value (accumulating). On poor/flat signal, any
+    error, or a device SpO2 / PR error, SpO2, PR and the estimated BP are sent as null."""
     result = _process_vitals(json_data)
     if not isinstance(result, dict):
         return result                     # None = facility-gated, nothing to emit
@@ -448,7 +507,7 @@ def process_vitals(json_data):
         if isinstance(in_bp, dict):       # input bp fields win; only the estimates are ours
             bp = {**bp, **in_bp, **{k: bp[k] for k in _EST_KEYS + _HIDDEN_EST_KEYS if k in bp}}
         out["bp"] = bp
-    return out
+    return _null_on_error(out)
 
 
 def _process_vitals(json_data):

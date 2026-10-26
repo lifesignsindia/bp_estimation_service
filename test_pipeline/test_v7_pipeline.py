@@ -227,13 +227,14 @@ def run():
           "displayed payloads carry integer bp.estimated_sbp/dbp/map > 0")
     check(all(x["bp"]["estimated_map"] == int(round((x["bp"]["estimated_sbp"] + 2 * x["bp"]["estimated_dbp"]) / 3))
               for x in shown), "estimated_map = (sbp + 2*dbp) / 3")
-    check(not any(k.startswith("estimated_") for x in hidden for k in (x.get("bp") or {})),
-          "no hidden payload carries a lowercase bp.estimated_* key")
+    check(not any(k.startswith("estimated_") and v is not None for x in hidden for k, v in (x.get("bp") or {}).items()),
+          "no hidden payload carries a lowercase bp.estimated_* value (null only)")
     acc_vals = [x for x in hidden if x["status"] == "accumulating" and "Estimated_sbp" in (x.get("bp") or {})]
     check(len(acc_vals) > 0 and all(all(isinstance(x["bp"].get(k), int) and x["bp"][k] > 0
                                         for k in ("Estimated_sbp", "Estimated_dbp", "Estimated_map")) for x in acc_vals),
           f"accumulating values arrive as integer bp.Estimated_sbp/dbp/map ({len(acc_vals)} seen)")
-    check(not any(k.startswith("Estimated_") for x in hidden if x["status"] != "accumulating" for k in (x.get("bp") or {})),
+    check(not any(k.lower().startswith("estimated_") and v is not None
+                  for x in hidden if x["status"] != "accumulating" for k, v in (x.get("bp") or {}).items()),
           "ignored / poor_signal / error carry no BP value")
     check({"ignored", "poor_signal", "accumulating"} <= {x["status"] for x in hidden},
           "ignored, poor_signal and accumulating results are all tagged display=false")
@@ -258,8 +259,47 @@ def run():
         bad = [VS.process_vitals(epoch(eps[i % len(eps)], t + 6 + i)) for i in range(2)]
     finally:
         VS._EST_SBP_RANGE = _orig_lo
-    check(not any(x["display"] or any(k.lower().startswith("estimated_") for k in (x.get("bp") or {})) for x in bad),
+    check(not any(x["display"] or any(k.lower().startswith("estimated_") and v is not None
+                                      for k, v in (x.get("bp") or {}).items()) for x in bad),
           "an out-of-range estimate is never published as an estimate")
+
+    # ---- 10. null on poor/flat signal, any error, or a device SpO2 / PR error ---------------
+    def nulled(x):
+        bp, sp = x.get("bp") or {}, x.get("spo2") or {}
+        return (all(k in bp and bp[k] is None for k in ("estimated_sbp", "estimated_dbp", "estimated_map"))
+                and not any(k in sp and sp[k] is not None for k in ("spo2", "SPO2", "pulseRate", "PR"))
+                and x["display"] is False)
+    check(nulled(r_flat) and r_flat["spo2"].get("SPO2", 1) is None and r_flat["spo2"].get("PR", 1) is None
+          and r_flat["spo2"]["PR_ALL"] == [72] * 10,
+          "flat signal: SPO2, PR and estimated_sbp/dbp/map sent as null (PR_ALL untouched)")
+    check(nulled(r_noise), "poor signal: SpO2, PR and estimated BP sent as null")
+    check(nulled(rh) and rh["bp"]["BPSYS"] == 118 and rh["bp"]["BPDIA"] == 76 and rh["bp"]["BP_ERROR"] == 3
+          and "spo2" not in rh, "cuff error: estimated BP null, cuff reading untouched, no spo2 block invented")
+    mongo_ok = {"spo2": 98, "pulseRate": 71, "pi": 3.2, "spo2Error": 0, "spo2ErrorMsg": "SPO2_VALID", "prAllData": [71] * 5}
+    pk = epoch(eps[1], t + 9); pk["admissionId"] = "ADM_TEST_DEVERR"; pk["spo2"] = dict(mongo_ok)
+    r_ok = VS.process_vitals(pk)
+    check(r_ok["spo2"]["spo2"] == 98 and r_ok["spo2"]["pulseRate"] == 71,
+          "valid device SpO2/PR (SPO2_VALID) pass through unchanged")
+    for label, extra, code in (("PR_INVALID_DATA", {"prErrorMsg": "PR_INVALID_DATA"}, "PR_INVALID"),
+                               ("SPO2_UNKNOWN_ERROR", {"spo2ErrorMsg": "SPO2_UNKNOWN_ERROR"}, "SPO2_INVALID"),
+                               ("spo2Error=2", {"spo2Error": 2}, "SPO2_INVALID")):
+        pk = epoch(eps[1], t + 10); pk["admissionId"] = "ADM_TEST_DEVERR"
+        pk["spo2"] = {**mongo_ok, **extra}
+        rx = VS.process_vitals(pk)
+        check(nulled(rx) and rx["spo2"]["spo2"] is None and rx["spo2"]["pulseRate"] is None
+              and (rx["error_code"] == code or rx["status"] in ("poor_signal", "error", "ignored")),
+              f"device {label}: spo2, pulseRate and estimated BP null (error_code={rx['error_code']})")
+    dropped = {k: v for k, v in mongo_ok.items() if k not in ("spo2", "pulseRate")}
+    pk = epoch(eps[1], t + 11); pk["admissionId"] = "ADM_TEST_DEVERR"
+    pk["spo2"] = {**dropped, "spo2ErrorMsg": "SPO2_UNKNOWN_ERROR", "prErrorMsg": "PR_INVALID_DATA"}
+    rx = VS.process_vitals(pk)
+    check(rx["spo2"].get("spo2", 1) is None and rx["spo2"].get("pulseRate", 1) is None and nulled(rx),
+          "device that DROPPED spo2/pulseRate on error: keys sent as null instead of missing")
+    shown_ok = VS._null_on_error({"status": "success", "display": True, "error_code": None, "message": "m",
+                                  "bp": {"estimated_sbp": 120, "estimated_dbp": 80, "estimated_map": 93},
+                                  "spo2": {**mongo_ok, "prErrorMsg": "PR_INVALID_DATA"}})
+    check(nulled(shown_ok) and shown_ok["error_code"] == "PR_INVALID" and shown_ok["status"] == "success",
+          "a 15-min success packet with a device PR error: estimated BP null, display false, error_code PR_INVALID")
 
     # ---- 6. forced alert: +20 mmHg delta from a fresh cuff --------------------------------
     class _Plus:

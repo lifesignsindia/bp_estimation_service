@@ -98,12 +98,41 @@ Each payload carries `"display": true|false`:
 
 | status | display | BP keys |
 |---|---|---|
-| `success`, `alert` (incl. `CALIBRATING`) | `true` | `bp.estimated_sbp`, `bp.estimated_dbp` (unchanged) |
-| `accumulating` (per-epoch v7 value, ~every 3 min) | `false` | `bp.Estimated_sbp`, `bp.Estimated_dbp` |
-| `poor_signal`, `ignored`, `error` | `false` | no BP |
+| `success`, `alert` (incl. `CALIBRATING`) | `true` | `bp.estimated_sbp`, `bp.estimated_dbp`, `bp.estimated_map` (integers) |
+| `accumulating` (per-epoch v7 value, ~every 3 min) | `false` | `bp.Estimated_sbp`, `bp.Estimated_dbp`, `bp.Estimated_map` (capital E, integers) |
+| `poor_signal`, `ignored`, `error` | `false` | no estimated BP |
 
-The UI reads lowercase `estimated_sbp`, so non-display values are stored by the backend but never
-shown. The rename is done in one place, `process_vitals`, for every non-display result.
+The two casings are deliberate: the backend shows only lowercase `estimated_*` (exact,
+case-sensitive match) and stores capital-E `Estimated_*` without showing it.
+
+### Output contract (2026-10-20, backend integration review)
+
+- **The output is the input packet plus our fields.** Every input field keeps its name and value
+  (facilityId, patientId, the original `pleth` block, a cuff packet's `bp` block, unknown fields).
+  `deviceName` / `deviceType` / `timestamp` are only added when the input lacks them. In the `bp`
+  block only `estimated_sbp/dbp/map` are ours; any input bp field wins over our other bp fields.
+  NISO101 packets still get `spo2.PR` added (mean of `PR_ALL`).
+- **Lowercase estimates only on display packets**, so `bp.estimated_sbp > 0` (case-sensitive)
+  identifies a shown estimate. Accumulating packets carry `bp.Estimated_*` for storage. All
+  values are integers; MAP = `round((sbp + 2*dbp) / 3)`.
+- **Range check.** A display estimate outside SBP 40-300 / DBP 20-200, or with SBP <= DBP, becomes
+  `status: error`, `error_code: ESTIMATE_OUT_OF_RANGE` (env `EBP_EST_SBP_MIN/MAX`, `EBP_EST_DBP_MIN/MAX`).
+- **`error_code`** on every packet: `null` for success, alert, accumulating and an accepted cuff;
+  otherwise one of `CUFF_HW_ERROR`, `CUFF_SENTINEL`, `CUFF_EMPTY`, `CUFF_DUPLICATE`,
+  `UNKNOWN_DEVICE`, `DEVICE_LOCKED`, `POOR_SIGNAL`, `FLAT_SIGNAL`, `SIGNAL_TOO_SHORT`,
+  `NO_REFERENCE_CUFF`, `EPOCH_REJECTED`, `INFERENCE_FAILED`, `ESTIMATE_OUT_OF_RANGE`.
+  `message` stays as human-readable detail.
+
+- **Null on error.** On `poor_signal` (incl. flat signal), any `error`, or a device SpO2 / PR error
+  in the spo2 block (`spo2Error`/`SPO2_ERROR` non-zero, or `spo2ErrorMsg` / `prErrorMsg` not a
+  `*_VALID` message, e.g. `SPO2_UNKNOWN_ERROR`, `PR_INVALID_DATA`), the packet carries SpO2, PR
+  (`spo2`/`pulseRate`, or `SPO2`/`PR`) and `bp.estimated_sbp/dbp/map` as JSON `null`, keys present
+  even when the device dropped them; accumulating `Estimated_*` are nulled too. Cuff readings are
+  never touched and no spo2 block is invented. Such a packet has `display: false`; when it had no
+  error_code it gets `SPO2_INVALID`, `PR_INVALID` or `SPO2_PR_INVALID` (this includes a 15-min
+  success/alert packet, whose estimate is then null).
+
+All of it is applied in one place, `process_vitals`.
 
 ## State
 

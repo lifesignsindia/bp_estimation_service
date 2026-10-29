@@ -165,7 +165,7 @@ next to `ref:{adm}` so pods and restarts share it.
 - No estimate without a cuff. First alert ~1 h after the cuff. (2026-09-28: the cuff itself is
   now shown as `CALIBRATING` from ~3 min after it, until the first 15-min value.) Alerts latch until a new cuff.
 - Kept as-is, still temporary: the facility gate (`EBP_ALLOWED_FACILITY`, default
-  `CF1315821527` only since 2026-09-05, `CF1315821527,CF199221737` since 2026-09-28; comma-separate to add, empty to disable) and the Mongo
+  `CF1315821527` only since 2026-09-05, `CF1315821527,CF199221737` since 2026-09-28, `CF1315821527,CF199221737,CF965742886,CF1094500946` since 2026-10-29; comma-separate to add, empty to disable) and the Mongo
   shadow sink (`MONGO_SINK_ENABLED`).
 - 2026-09-28 cuff path: `0/0` (or any zero half) is "no reading" and ignored. A non-manual cuff
   within 5 mmHg of the stored reference is a re-send and keeps the stored reference AND its

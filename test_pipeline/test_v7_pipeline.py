@@ -15,9 +15,13 @@ Checks
   7. CALIBRATING: from the first epoch after a cuff, the cuff itself is published (confidence
      CALIBRATING) at most once per slot, and never again once the first 15-min value is out;
      a new cuff restarts it with the new value; V7_CAL_PUBLISH=0 switches it off
-  8. display: success/alert carry display=true and bp.estimated_sbp/dbp; every other status
-     (accumulating, poor_signal, ignored, error) carries display=false and its BP only as
-     bp.Estimated_sbp/Estimated_dbp, so the backend can store it without showing it
+  8. output contract: every result is the INPUT packet with our fields added (no input field
+     renamed or changed, facilityId kept on cuff packets too) and carries display + error_code;
+     success/alert carry display=true and integer bp.estimated_sbp/dbp/map (map = (s+2d)/3);
+     every other status carries display=false and never a lowercase estimate; accumulating
+     carries its per-epoch value as integer bp.Estimated_sbp/dbp/map (capital E) for storage;
+     an estimate outside the valid range is published as error ESTIMATE_OUT_OF_RANGE and is
+     never sent under either casing
   3. flat and noisy epochs are dropped from the slot (poor_signal, not published, not counted)
   4. the published payload keeps the legacy shape (bp block, sqi, pleth, Hb/glucose, _meta)
   5. a new cuff rebuilds the anchor and clears any alert
@@ -169,7 +173,7 @@ def run():
         check(k in p, f"payload has '{k}'")
     for k in ("estimated_sbp", "estimated_dbp", "category", "trend", "BP_ERROR", "reference_sbp", "reference_dbp"):
         check(k in p["bp"], f"bp block has '{k}'")
-    check(p["deviceName"] == "NISO101" and p["pleth"].get("PLETH"), "deviceName mapped and pleth echoed")
+    check(p["deviceName"] == "NISO101" and p["pleth"].get("plethWave"), "deviceName mapped and the input pleth block passed through")
     check(p["bp"]["reference_sbp"] == 120 and p["bp"]["reference_dbp"] == 80, "reference in payload is the live cuff")
     check(abs(p["bp"]["estimated_sbp"] - 120) <= 25 and abs(p["bp"]["estimated_dbp"] - 80) <= 25, "estimate is cuff +- cap")
     check(("hemoglobin" in p) and ("glucose" in p), "Hb and glucose came from the legacy engine")
@@ -207,23 +211,95 @@ def run():
     check((rq.get("sqi") or {}).get("v7_quality") == "GOOD",
           f"cut-short BerryMed packet of 2160 samples is still read at 200 Hz (q={(rq.get('sqi') or {}).get('v7_quality')})")
 
-    # ---- 8. display flag + Estimated_* on everything that must not be shown ----------------
+    # ---- 8. output contract: input packet preserved, display, error_code, integer estimates --
     allr += [r_flat, r_noise]
     check(all(isinstance(x.get("display"), bool) for x in allr), "every result carries a display flag")
     check(all(x["display"] == (x["status"] in ("success", "alert")) for x in allr),
           "display=true exactly for success/alert (CALIBRATING included), false for everything else")
+    check(all("error_code" in x for x in allr), "every result carries error_code")
+    check(all(x["error_code"] is None for x in allr if x["display"]), "success/alert have error_code null")
+    check(all(x["error_code"] for x in allr if x["status"] in ("error", "poor_signal")),
+          "every error / poor_signal result has an error_code")
     shown = [x for x in allr if x["display"]]
     hidden = [x for x in allr if not x["display"]]
-    check(all("estimated_sbp" in x["bp"] and "Estimated_sbp" not in x["bp"] for x in shown),
-          "displayed payloads keep bp.estimated_sbp/dbp")
-    check(not any("estimated_sbp" in (x.get("bp") or {}) or "estimated_dbp" in (x.get("bp") or {}) for x in hidden),
-          "no hidden payload carries bp.estimated_sbp/dbp")
-    acc_vals = [x for x in hidden if x["status"] == "accumulating" and (x.get("bp") or {}).get("Estimated_sbp") is not None]
-    check(len(acc_vals) > 0 and all(isinstance(x["bp"]["Estimated_dbp"], (int, float)) for x in acc_vals),
-          f"per-epoch accumulating values arrive as bp.Estimated_sbp/dbp ({len(acc_vals)} seen)")
+    check(len(shown) > 0 and all(all(isinstance(x["bp"].get(k), int) and x["bp"][k] > 0
+                                     for k in ("estimated_sbp", "estimated_dbp", "estimated_map")) for x in shown),
+          "displayed payloads carry integer bp.estimated_sbp/dbp/map > 0")
+    check(all(x["bp"]["estimated_map"] == int(round((x["bp"]["estimated_sbp"] + 2 * x["bp"]["estimated_dbp"]) / 3))
+              for x in shown), "estimated_map = (sbp + 2*dbp) / 3")
+    check(not any(k.startswith("estimated_") and v is not None for x in hidden for k, v in (x.get("bp") or {}).items()),
+          "no hidden payload carries a lowercase bp.estimated_* value (null only)")
+    acc_vals = [x for x in hidden if x["status"] == "accumulating" and "Estimated_sbp" in (x.get("bp") or {})]
+    check(len(acc_vals) > 0 and all(all(isinstance(x["bp"].get(k), int) and x["bp"][k] > 0
+                                        for k in ("Estimated_sbp", "Estimated_dbp", "Estimated_map")) for x in acc_vals),
+          f"accumulating values arrive as integer bp.Estimated_sbp/dbp/map ({len(acc_vals)} seen)")
+    check(not any(k.lower().startswith("estimated_") and v is not None
+                  for x in hidden if x["status"] != "accumulating" for k, v in (x.get("bp") or {}).items()),
+          "ignored / poor_signal / error carry no BP value")
     check({"ignored", "poor_signal", "accumulating"} <= {x["status"] for x in hidden},
           "ignored, poor_signal and accumulating results are all tagged display=false")
-    print("  sample hidden payload:", json.dumps({k: v for k, v in acc_vals[0].items() if k not in ("pleth", "spo2")})[:400])
+    check(all(x.get("facilityId") == FAC and x.get("patientId") == "P1" and x.get("seqNum") == 1
+              and x["pleth"].get("plethWave") is not None for x in allr if x.get("patientId")),
+          "pleth packets keep facilityId, patientId, seqNum and the original pleth block")
+    probe = epoch(eps[0], t + 3); probe["extraField"] = {"keep": "me"}; probe["deviceType"] = "RAW"
+    rp = VS.process_vitals(probe)
+    check(rp.get("extraField") == {"keep": "me"} and rp.get("deviceType") == "RAW",
+          "unknown input fields pass through and input values are not overwritten")
+    rc = VS.process_vitals({**cuff(118, 76, t + 4), "admissionId": "ADM_TEST_CUFF_FIELDS", "patientId": "P9"})
+    check(rc.get("facilityId") == FAC and rc.get("patientId") == "P9" and rc["bp"] == {"BPSYS": 118, "BPDIA": 76, "BP_ERROR": 0}
+          and rc["display"] is False and rc["error_code"] is None,
+          "cuff packets keep facilityId and the input bp block unchanged")
+    rh = VS.process_vitals({**cuff(118, 76, t + 5), "admissionId": "ADM_TEST_CUFF_FIELDS",
+                            "bp": {"BPSYS": 118, "BPDIA": 76, "BP_ERROR": 3}})
+    check(rh["status"] == "error" and rh["error_code"] == "CUFF_HW_ERROR" and rh.get("facilityId") == FAC,
+          "cuff hardware error -> error_code CUFF_HW_ERROR, facilityId kept")
+    _orig_lo = VS._EST_SBP_RANGE
+    VS._EST_SBP_RANGE = (500.0, 600.0)                      # force every estimate out of range
+    try:
+        bad = [VS.process_vitals(epoch(eps[i % len(eps)], t + 6 + i)) for i in range(2)]
+    finally:
+        VS._EST_SBP_RANGE = _orig_lo
+    check(not any(x["display"] or any(k.lower().startswith("estimated_") and v is not None
+                                      for k, v in (x.get("bp") or {}).items()) for x in bad),
+          "an out-of-range estimate is never published as an estimate")
+
+    # ---- 10. null on poor/flat signal, any error, or a device SpO2 / PR error ---------------
+    def nulled(x):
+        bp, sp = x.get("bp") or {}, x.get("spo2") or {}
+        return (all(k in bp and bp[k] is None for k in ("estimated_sbp", "estimated_dbp", "estimated_map"))
+                and not any(k in sp and sp[k] is not None for k in ("spo2", "SPO2", "pulseRate", "PR"))
+                and x["display"] is False)
+    check(nulled(r_flat) and r_flat["spo2"].get("SPO2", 1) is None and r_flat["spo2"].get("PR", 1) is None
+          and r_flat["spo2"]["PR_ALL"] == [72] * 10,
+          "flat signal: SPO2, PR and estimated_sbp/dbp/map sent as null (PR_ALL untouched)")
+    check(nulled(r_noise), "poor signal: SpO2, PR and estimated BP sent as null")
+    check(nulled(rh) and rh["bp"]["BPSYS"] == 118 and rh["bp"]["BPDIA"] == 76 and rh["bp"]["BP_ERROR"] == 3
+          and "spo2" not in rh, "cuff error: estimated BP null, cuff reading untouched, no spo2 block invented")
+    mongo_ok = {"spo2": 98, "pulseRate": 71, "pi": 3.2, "spo2Error": 0, "spo2ErrorMsg": "SPO2_VALID", "prAllData": [71] * 5}
+    pk = epoch(eps[1], t + 9); pk["admissionId"] = "ADM_TEST_DEVERR"; pk["spo2"] = dict(mongo_ok)
+    r_ok = VS.process_vitals(pk)
+    check(r_ok["spo2"]["spo2"] == 98 and r_ok["spo2"]["pulseRate"] == 71,
+          "valid device SpO2/PR (SPO2_VALID) pass through unchanged")
+    for label, extra, code in (("PR_INVALID_DATA", {"prErrorMsg": "PR_INVALID_DATA"}, "PR_INVALID"),
+                               ("SPO2_UNKNOWN_ERROR", {"spo2ErrorMsg": "SPO2_UNKNOWN_ERROR"}, "SPO2_INVALID"),
+                               ("spo2Error=2", {"spo2Error": 2}, "SPO2_INVALID")):
+        pk = epoch(eps[1], t + 10); pk["admissionId"] = "ADM_TEST_DEVERR"
+        pk["spo2"] = {**mongo_ok, **extra}
+        rx = VS.process_vitals(pk)
+        check(nulled(rx) and rx["spo2"]["spo2"] is None and rx["spo2"]["pulseRate"] is None
+              and (rx["error_code"] == code or rx["status"] in ("poor_signal", "error", "ignored")),
+              f"device {label}: spo2, pulseRate and estimated BP null (error_code={rx['error_code']})")
+    dropped = {k: v for k, v in mongo_ok.items() if k not in ("spo2", "pulseRate")}
+    pk = epoch(eps[1], t + 11); pk["admissionId"] = "ADM_TEST_DEVERR"
+    pk["spo2"] = {**dropped, "spo2ErrorMsg": "SPO2_UNKNOWN_ERROR", "prErrorMsg": "PR_INVALID_DATA"}
+    rx = VS.process_vitals(pk)
+    check(rx["spo2"].get("spo2", 1) is None and rx["spo2"].get("pulseRate", 1) is None and nulled(rx),
+          "device that DROPPED spo2/pulseRate on error: keys sent as null instead of missing")
+    shown_ok = VS._null_on_error({"status": "success", "display": True, "error_code": None, "message": "m",
+                                  "bp": {"estimated_sbp": 120, "estimated_dbp": 80, "estimated_map": 93},
+                                  "spo2": {**mongo_ok, "prErrorMsg": "PR_INVALID_DATA"}})
+    check(nulled(shown_ok) and shown_ok["error_code"] == "PR_INVALID" and shown_ok["status"] == "success",
+          "a 15-min success packet with a device PR error: estimated BP null, display false, error_code PR_INVALID")
 
     # ---- 6. forced alert: +20 mmHg delta from a fresh cuff --------------------------------
     class _Plus:

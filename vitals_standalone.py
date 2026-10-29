@@ -383,37 +383,141 @@ def _niso101_pr_from_pr_all(json_data):
             sp["PR"] = int(round(sum(vals) / len(vals)))
 
 
-# Only these statuses are meant to be SHOWN. Everything else still reaches the backend (for
-# logging / audit) but carries display=false and its BP under Estimated_sbp / Estimated_dbp,
-# so a screen reading bp.estimated_sbp never picks up a per-epoch value by accident.
+# Only these statuses carry a BP estimate meant to be SHOWN, as lowercase bp.estimated_*. Every
+# other status still reaches the backend (for storage / audit) with display=false; when it has a
+# per-epoch value (accumulating) that value goes under capital-E bp.Estimated_*, so a reader of
+# bp.estimated_sbp (exact, case-sensitive) never shows it.
 DISPLAY_STATUSES = {"success", "alert"}
+
+# The estimate keys in the bp block. Always integers.
+_EST_KEYS = ("estimated_sbp", "estimated_dbp", "estimated_map")
+_HIDDEN_EST_KEYS = ("Estimated_sbp", "Estimated_dbp", "Estimated_map")
+
+# Top-level keys this service owns. Every other key in the output is the input packet's own field,
+# passed through exactly as received; ours are only added when the input does not have them.
+_OUTPUT_KEYS = {"status", "display", "error_code", "message", "confidence", "reading_count",
+                "alert", "sqi", "trending", "morphology_change", "window", "hemoglobin",
+                "glucose", "elapsed_seconds", "target_seconds"}
+
+# A displayed estimate outside this range is not published as an estimate (the backend treats any
+# value > 0 as valid and runs its alert rules on it). The cuff gate only rejects <=0 and >=400/200,
+# so a bad manual cuff could otherwise carry v7 (cuff +-25) to a value <= 0.
+_EST_SBP_RANGE = (float(os.getenv("EBP_EST_SBP_MIN", "40")), float(os.getenv("EBP_EST_SBP_MAX", "300")))
+_EST_DBP_RANGE = (float(os.getenv("EBP_EST_DBP_MIN", "20")), float(os.getenv("EBP_EST_DBP_MAX", "200")))
+
+
+# Device SpO2 / PR error flags inside the spo2 block (Mongo spelling, then live-socket spelling).
+_SPO2_ERR_KEYS, _SPO2_MSG_KEYS = ("spo2Error", "SPO2_ERROR"), ("spo2ErrorMsg", "SPO2_ERROR_MSG", "sp2ErrorMsg")
+_PR_ERR_KEYS, _PR_MSG_KEYS = ("prError", "PR_ERROR"), ("prErrorMsg", "PR_ERROR_MSG")
+_OK_MSGS = {"", "NONE", "NO ERROR", "NO_ERROR", "OK"}
+# Statuses whose packet must not carry a SpO2, PR or estimated BP value.
+_NULL_STATUSES = {"poor_signal", "error"}
+
+
+def _device_flagged(block, err_keys, msg_keys):
+    """True when the device marks this reading invalid: a non-zero error number, or an error
+    message that is not a *_VALID / no-error message (e.g. SPO2_UNKNOWN_ERROR, PR_INVALID_DATA)."""
+    for k in err_keys:
+        v = block.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v != 0:
+            return True
+    for k in msg_keys:
+        v = block.get(k)
+        if isinstance(v, str):
+            m = v.strip().upper()
+            if m not in _OK_MSGS and not m.endswith("_VALID"):
+                return True
+    return False
+
+
+def _null_on_error(out):
+    """On poor signal, flat signal, any error, or a device SpO2 / PR error, send SpO2, PR and the
+    estimated BP as null instead of leaving them out or sending a value. Cuff readings are never
+    touched. A packet nulled this way is never displayed."""
+    sp = out.get("spo2") if isinstance(out.get("spo2"), dict) else None
+    bad_spo2 = sp is not None and _device_flagged(sp, _SPO2_ERR_KEYS, _SPO2_MSG_KEYS)
+    bad_pr = sp is not None and _device_flagged(sp, _PR_ERR_KEYS, _PR_MSG_KEYS)
+    if not (bad_spo2 or bad_pr or out.get("status") in _NULL_STATUSES):
+        return out
+    if sp is not None:
+        sp = dict(sp)
+        upper = any(k in sp for k in ("SPO2", "PR", "PR_ALL", "SPO2_ERROR"))
+        for k in ("spo2", "SPO2", "pulseRate", "PR"):
+            if k in sp:
+                sp[k] = None
+        sp.setdefault("SPO2" if upper else "spo2", None)
+        sp.setdefault("PR" if upper else "pulseRate", None)
+        out["spo2"] = sp
+    bp = dict(out["bp"]) if isinstance(out.get("bp"), dict) else {}
+    for k in _HIDDEN_EST_KEYS:
+        if k in bp:
+            bp[k] = None
+    bp.update(dict.fromkeys(_EST_KEYS))
+    out["bp"] = bp
+    out["display"] = False
+    if out.get("error_code") is None:
+        out["error_code"] = ("SPO2_PR_INVALID" if bad_spo2 and bad_pr
+                             else "SPO2_INVALID" if bad_spo2 else "PR_INVALID")
+        out["message"] = (f"{out.get('message', '')} Device reported "
+                          f"{'SpO2 and PR' if bad_spo2 and bad_pr else 'SpO2' if bad_spo2 else 'PR'} "
+                          f"invalid; SpO2, PR and estimated BP sent as null.").strip()
+    return out
+
+
+def _estimate_valid(sbp, dbp):
+    if not isinstance(sbp, (int, float)) or not isinstance(dbp, (int, float)):
+        return False
+    return (_EST_SBP_RANGE[0] <= sbp <= _EST_SBP_RANGE[1]
+            and _EST_DBP_RANGE[0] <= dbp <= _EST_DBP_RANGE[1] and sbp > dbp)
 
 
 def process_vitals(json_data):
     """Takes JSON, identifies device, routes to DSP, and returns AI predictions.
-    Every result is tagged display=true/false; non-display results have their bp
-    estimated_sbp/estimated_dbp renamed to Estimated_sbp/Estimated_dbp."""
+
+    The output is the INPUT packet with our fields added: every input field keeps its name and
+    value, and in the bp block only estimated_sbp / estimated_dbp / estimated_map are ours to set.
+    Every result carries display (true only for success/alert) and error_code (null unless
+    something went wrong or the packet was ignored). Estimates are integers with a MAP, and only
+    sent when inside the physiological range: lowercase estimated_* on success/alert, capital-E
+    Estimated_* on every other status that has a value (accumulating). On poor/flat signal, any
+    error, or a device SpO2 / PR error, SpO2, PR and the estimated BP are sent as null."""
     result = _process_vitals(json_data)
     if not isinstance(result, dict):
         return result                     # None = facility-gated, nothing to emit
-    display = result.get("status") in DISPLAY_STATUSES
-    result["display"] = display
-    bp = result.get("bp")
-    if not display and isinstance(bp, dict):
-        for k in ("sbp", "dbp"):
-            if "estimated_" + k in bp:
-                bp["Estimated_" + k] = bp.pop("estimated_" + k)
-    return result
+    bp = dict(result.pop("bp", None) or {})
+    s, d = bp.pop("estimated_sbp", None), bp.pop("estimated_dbp", None)
+    bp.pop("estimated_map", None)
+    valid = _estimate_valid(s, d)
+    if result.get("status") in DISPLAY_STATUSES and not valid:
+        result.update(status="error", error_code="ESTIMATE_OUT_OF_RANGE",
+                      message=f"Estimate {s}/{d} outside the valid range; not published.")
+    elif valid:
+        s, d = int(round(s)), int(round(d))
+        keys = _EST_KEYS if result.get("status") in DISPLAY_STATUSES else _HIDDEN_EST_KEYS
+        bp.update(zip(keys, (s, d, int(round((s + 2 * d) / 3)))))
+    result["display"] = result.get("status") in DISPLAY_STATUSES
+    result.setdefault("error_code", None)
+
+    out = dict(json_data)
+    for k, v in result.items():
+        if k in _OUTPUT_KEYS or k not in out:
+            out[k] = v
+    in_bp = json_data.get("bp")
+    if bp:
+        if isinstance(in_bp, dict):       # input bp fields win; only the estimates are ours
+            bp = {**bp, **in_bp, **{k: bp[k] for k in _EST_KEYS + _HIDDEN_EST_KEYS if k in bp}}
+        out["bp"] = bp
+    return _null_on_error(out)
 
 
 def _process_vitals(json_data):
     adm_id = json_data.get("admissionId") or json_data.get("PatId") or json_data.get("deviceID") or json_data.get("BLEDeviceID", "UNKNOWN_PATIENT")
 
     # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────────
-    # Work ONLY for the allowed facilities (CF1315821527, CF199221737). Any other facility →
+    # Work ONLY for the allowed facilities (CF1315821527, CF199221737, CF965742886, CF1094500946). Any other facility →
     # return None: do nothing and emit no packet at all. Configurable via
     # EBP_ALLOWED_FACILITY (set empty to disable). REMOVE after the trial.
-    _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF199221737")
+    _allowed_facility = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF199221737,CF965742886,CF1094500946")
     if _allowed_facility:
         _allowed_set = {f.strip() for f in _allowed_facility.split(",") if f.strip()}
         _fac = _resolve_facility(json_data)
@@ -442,6 +546,7 @@ def _process_vitals(json_data):
         if cuff_error != 0:
             return {
                 "status": "error",
+                "error_code": "CUFF_HW_ERROR",
                 "admissionId": adm_id,
                 "message": f"Cuff hardware error (BP_ERROR={cuff_error}). Reading {sys_val}/{dia_val} rejected."
             }
@@ -449,6 +554,7 @@ def _process_vitals(json_data):
         if sys_val >= 400 or dia_val >= 200:
             return {
                 "status": "error",
+                "error_code": "CUFF_SENTINEL",
                 "admissionId": adm_id,
                 "message": f"Device error sentinel received ({sys_val}/{dia_val}). Cuff reading ignored."
             }
@@ -459,6 +565,7 @@ def _process_vitals(json_data):
         if sys_val <= 0 or dia_val <= 0:
             return {
                 "status": "ignored",
+                "error_code": "CUFF_EMPTY",
                 "admissionId": adm_id,
                 "message": f"Empty cuff reading ({sys_val}/{dia_val}) ignored; reference unchanged."
             }
@@ -489,6 +596,7 @@ def _process_vitals(json_data):
         if not ref_changed and not _is_manual and prev_ref.get("sbp", 0) > 0:
             return {
                 "status": "ignored",
+                "error_code": "CUFF_DUPLICATE",
                 "admissionId": adm_id,
                 "message": f"Duplicate reference ignored (value unchanged at {sys_val}/{dia_val}; "
                            f"reference kept from {prev_ref.get('timestamp')})."
@@ -536,7 +644,7 @@ def _process_vitals(json_data):
     ] if k in json_data}
 
     if device_type == "UNKNOWN":
-        return {**_meta, "status": "error", "admissionId": adm_id,
+        return {**_meta, "status": "error", "error_code": "UNKNOWN_DEVICE", "admissionId": adm_id,
                 "message": f"Unknown deviceName: {json_data.get('deviceName')}. Expected NISO101/NISO103/NISO204."}
 
     # --- PRIMARY DEVICE LOCK (NISO101 preferred) ---
@@ -557,7 +665,7 @@ def _process_vitals(json_data):
     elif _primary != device_type:
         print(f"[LOCK] adm={adm_id} | device={device_type} ignored | admission locked to primary={_primary}")
         sys.stdout.flush()
-        return {**_meta, "status": "ignored", "admissionId": adm_id,
+        return {**_meta, "status": "ignored", "error_code": "DEVICE_LOCKED", "admissionId": adm_id,
                 "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
                 "deviceType": "BP_SPO2",
                 "message": f"Device {_DEVICE_NAME_MAP.get(device_type, device_type)} ignored. "
@@ -611,6 +719,7 @@ def _process_vitals(json_data):
         sqi_flag = sqi_info.get("flag", "INVALID")
         return {**_meta,
             "status": "poor_signal",
+            "error_code": "POOR_SIGNAL",
             "admissionId": adm_id,
             "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
             "deviceType": "BP_SPO2",
@@ -632,6 +741,7 @@ def _process_vitals(json_data):
             _flat_sqi = {"score": 0.0, "valid": False, "flag": "FLAT_SIGNAL"}
             return {**_meta,
                 "status": "poor_signal",
+                "error_code": "FLAT_SIGNAL",
                 "admissionId": adm_id,
                 "deviceName": _DEVICE_NAME_MAP.get(device_type, device_type),
                 "deviceType": "BP_SPO2",
@@ -641,7 +751,7 @@ def _process_vitals(json_data):
             }
 
     if len(model_ready_pleth) < 120:
-        return {**_meta, "status": "error", "admissionId": adm_id, "message": "Signal too short for AI inference."}
+        return {**_meta, "status": "error", "error_code": "SIGNAL_TOO_SHORT", "admissionId": adm_id, "message": "Signal too short for AI inference."}
 
     pleth_out = [round(float(x), 6) for x in model_ready_pleth]
 
@@ -729,14 +839,14 @@ def _process_vitals(json_data):
         if win is None:
             # ── per-epoch states: LOGGED by the consumer, never published ──────────────
             if res["state"] == "no reference":
-                return {**common, "status": "ignored", "sqi": sqi_out,
+                return {**common, "status": "ignored", "error_code": "NO_REFERENCE_CUFF", "sqi": sqi_out,
                         "message": "No reference cuff yet. v7 estimates change from a cuff, so nothing to anchor to."}
             if res["state"] == "calibrating":
                 return {**common, "status": "accumulating", "sqi": sqi_out,
                         "elapsed_seconds": 0, "target_seconds": int(V7_WINDOW_SEC), "bp": {},
                         "message": f"Building v7 anchor ({res['calibrating']} good epochs after the cuff)."}
             if not res["good"]:
-                return {**common, "status": "poor_signal", "sqi": sqi_out,
+                return {**common, "status": "poor_signal", "error_code": "EPOCH_REJECTED", "sqi": sqi_out,
                         "message": f"Epoch dropped from the 15-minute slot (v7 quality={res['quality']}, "
                                    f"beats={res['n_beats']}, corr={res['template_corr']})."}
             elapsed = int(epoch_ts - (ow.get("since") or epoch_ts))
@@ -804,7 +914,7 @@ def _process_vitals(json_data):
         # here, so the open slot is preserved.
         print(f"[ERR] Packet processing failed for {adm_id}: {e} -- packet skipped, window preserved.")
         sys.stdout.flush()
-        return {"status": "error", "admissionId": adm_id, "message": f"AI Inference Failed: {str(e)}"}
+        return {"status": "error", "error_code": "INFERENCE_FAILED", "admissionId": adm_id, "message": f"AI Inference Failed: {str(e)}"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. CLI Test Block

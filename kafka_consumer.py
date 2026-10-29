@@ -37,8 +37,9 @@ except Exception as e:
     sys.exit(1)
 
 # Every status reaches the output topic. Only success / alert carry display=true and
-# bp.estimated_sbp/dbp; per-epoch states (accumulating, poor_signal, ignored, error) carry
-# display=false and Estimated_sbp/dbp so the backend stores them without showing them
+# bp.estimated_sbp/dbp/map; per-epoch states (accumulating, poor_signal, ignored, error) carry
+# display=false; accumulating carries its per-epoch value as capital-E bp.Estimated_sbp/dbp/map,
+# so the backend stores it without showing it
 # (see process_vitals). EBP_FORWARD_STATUSES narrows it again, e.g. "success,alert".
 FORWARD_STATUSES = {s.strip() for s in os.getenv(
     "EBP_FORWARD_STATUSES", "success,alert,accumulating,poor_signal,ignored,error").split(",") if s.strip()}
@@ -161,11 +162,11 @@ def run():
         adm_id = payload.get("admissionId", "UNKNOWN")
 
         # ── TEMPORARY FACILITY GATE ───────────────────────────────────────────
-        # Only work for the allowed facilities (CF1315821527, CF199221737). Any other facility's
+        # Only work for the allowed facilities (CF1315821527, CF199221737, CF965742886, CF1094500946). Any other facility's
         # packet is dropped here — no parsing, no inference, no output produced.
         # Configurable via EBP_ALLOWED_FACILITY; set it empty to disable. REMOVE
         # after the trial.
-        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF199221737")
+        _allowed_fac = os.getenv("EBP_ALLOWED_FACILITY", "CF1315821527,CF199221737,CF965742886,CF1094500946")
         if _allowed_fac:
             _allowed_set = {f.strip() for f in _allowed_fac.split(",") if f.strip()}
             _fac = _resolve_facility(payload)
@@ -231,7 +232,7 @@ def run():
 
         if status in FORWARD_STATUSES:
             try:
-                out = {**result, "pleth": payload.get("pleth", {})}
+                out = result      # already the input packet + our fields (see process_vitals)
                 producer.produce(
                     cfg.KAFKA_OUTPUT_TOPIC,
                     key=adm_id.encode(),
@@ -259,9 +260,9 @@ def run():
             _debug("OUTPUT_FORWARDED", f"EBP={bp.get('estimated_sbp','-')}/{bp.get('estimated_dbp','-')}", adm_id, status)
 
         elif status == "accumulating":
-            bp      = result.get("bp", {})
             elapsed = result.get("elapsed_seconds", "-")
             target  = result.get("target_seconds",  "-")
+            bp      = result.get("bp", {})
             print(f"[ACC] {elapsed}s/{target}s | adm={adm_id} | EBP={bp.get('Estimated_sbp','-')}/{bp.get('Estimated_dbp','-')} (display=false)")
             sys.stdout.flush()
             _debug("ACCUMULATING", f"{elapsed}/{target}s", adm_id, status)

@@ -90,6 +90,33 @@ estimate, not the cuff. It does **not** count as a slot: `run`, the alert rule a
 untouched, and the same slot still publishes its full value at its end (still `LOW`, then `HIGH`
 on the next slot). One early value per cuff; a new cuff re-arms it. `V7_EARLY_FIRST=0` turns it off.
 
+### Re-anchor rule and smoothing (2026-11-03)
+
+**Re-anchor only on a real change.** A new cuff (device or manual) becomes the anchor only if it
+differs from the anchor held by >= 15 systolic or >= 10 diastolic. A cuff inside that range keeps
+the anchor, its baseline and the open slot (no re-calibration gap); it still retires a latched
+alert. The newest cuff seen is the forward-only limit for replays.
+
+**Smoothed value.** The published `estimated_*` is `anchor + 0.5 * (EMA - anchor)`, EMA = exponential
+average (alpha 0.25) of the GOOD per-epoch v7 values since the anchor. One noisy slot no longer
+swings the display and only half of v7's change is shown. The alert rule is unchanged: it still
+reads the raw slot median (`sbp_raw` / `dbp_raw` in the engine's window), because half of a
+capped 25 mmHg change could never reach the 15 mmHg breach.
+
+Replay on the CIMS NISO101 captures (60 cuffs, 23 patients; last value published before each real
+cuff vs that cuff):
+
+| | raw slot median (before) | smoothed (now) |
+|---|---|---|
+| SBP within 15 | 57% | 70% |
+| SBP within 15 and DBP within 10 | 47% | 55% |
+| MAP within 10 | 62% | 77% |
+| consecutive values >= 15/10 apart | 12% | 2% |
+
+Repeating the anchor cuff scores about the same (60% both, MAP 80%): v7's change is mostly noise
+on NISO101 (no single feature tracks BP between cuffs on this data), so the gain is from
+damping that noise, not from better tracking.
+
 ### Display flag (2026-09-28)
 
 Every result now reaches `vitals.clinical` (`EBP_FORWARD_STATUSES`, default
@@ -145,6 +172,9 @@ next to `ref:{adm}` so pods and restarts share it.
 | `V7_STALE_SEC` | 1800 | silence that discards the open slot |
 | `V7_EARLY_FIRST` | 1 | publish the first value after a cuff as soon as the open slot has 2 GOOD scored epochs (0 = wait for the slot end) |
 | `V7_CAL_PUBLISH` | 0 | publish the cuff as `CALIBRATING` until the first 15-min value (1 = on) |
+| `V7_REANCHOR_SBP` / `V7_REANCHOR_DBP` | 15 / 10 | a new cuff re-anchors only this far from the anchor (0 / 0 = every cuff) |
+| `V7_SMOOTH` | 1 | publish anchor + `V7_SMOOTH_SHRINK` x (EMA - anchor) instead of the raw slot median (0 = raw) |
+| `V7_SMOOTH_ALPHA` / `V7_SMOOTH_SHRINK` | 0.25 / 0.5 | EMA weight per GOOD epoch / share of v7's change shown |
 
 ## Decisions taken (2026-09-03)
 

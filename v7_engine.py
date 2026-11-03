@@ -23,7 +23,16 @@ MODEL
     v7 is a DELTA model: median(features in slot) - median(features right after the cuff)
     -> +-25 mmHg change on top of the live cuff. Without a cuff there is no estimate. Only
     GOOD epochs (beats >= 10, template corr >= 0.90, dicrotic notch found) build the anchor or
-    enter a window. Trained on MIMIC (19 patients, 464 pairs); day-5 blind run on CIMS caught
+    enter a window.
+
+ANCHOR RULE (2026-10-12)
+    A new cuff re-anchors ONLY if it differs from the anchor held by >= 15 systolic or >= 10
+    diastolic (V7_REANCHOR_SBP / V7_REANCHOR_DBP), manual entries included. A cuff inside that
+    range keeps the anchor, its learned baseline and the 15-min run (no re-calibration gap), but
+    it is still a fresh measurement: it retires a latched alert and restarts the breach count.
+    The newest cuff seen, anchored or not, is the forward-only limit for stale replays.
+
+    Trained on MIMIC (19 patients, 464 pairs); day-5 blind run on CIMS caught
     5 of 8 real moves 1.5-5.2 h early at 50% precision. See docs/V7_PIPELINE.md.
 
 Everything here is best-effort against Redis: a store failure degrades to "no state", never an
@@ -63,6 +72,24 @@ CAL_PUBLISH   = os.getenv("V7_CAL_PUBLISH", "0").strip().lower() not in ("0", "f
 # MIN_EP_WINDOW good scored epochs, instead of waiting for the slot to end (saves up to 15 min).
 # It does NOT count as a slot (run / alert / trend untouched); the slot still publishes at its end.
 EARLY_FIRST   = os.getenv("V7_EARLY_FIRST", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# Re-anchor rule: a new cuff moves the anchor ONLY if it differs from the anchor held by
+# >= V7_REANCHOR_SBP systolic or >= V7_REANCHOR_DBP diastolic. A cuff inside that range is still
+# a fresh measurement - it retires a latched alert - but the anchor, its learned baseline and the
+# 15-min run are kept, so v7 keeps publishing without a re-calibration gap. Applies to manual
+# entries too. V7_REANCHOR_SBP=0 and V7_REANCHOR_DBP=0 restore "every cuff re-anchors".
+REANCHOR_SBP  = float(os.getenv("V7_REANCHOR_SBP", "15"))
+REANCHOR_DBP  = float(os.getenv("V7_REANCHOR_DBP", "10"))
+# Output smoothing (2026-11-03): the published value is anchor + SHRINK * (EMA - anchor), where
+# EMA is an exponential average (alpha SMOOTH_ALPHA) of the GOOD per-epoch v7 values since the
+# anchor, instead of the raw slot median. One noisy slot no longer swings the display, and only
+# half of v7's change is trusted. Replay of this engine on the CIMS NISO101 captures (60 cuffs,
+# 23 patients, last value before each cuff vs that cuff): SBP +-15 57% -> 70%, SBP +-15 and DBP
+# +-10 47% -> 55%, MAP +-10 62% -> 77%, slot-to-slot swings >=15/10 12% -> 2%. The alert rule still
+# reads the raw slot median, which is returned too (sbp_raw / dbp_raw). V7_SMOOTH=off restores the
+# raw slot median as the published value.
+SMOOTH        = os.getenv("V7_SMOOTH", "1").strip().lower() not in ("0", "false", "no", "off", "")
+SMOOTH_ALPHA  = float(os.getenv("V7_SMOOTH_ALPHA", "0.25"))
+SMOOTH_SHRINK = float(os.getenv("V7_SMOOTH_SHRINK", "0.5"))
 TREND_HIST    = 5                                             # slots kept for the trend field
 
 _CORE = ["aix", "ri", "ipa", "dvp_time", "stiffness_idx"]     # all-NaN together <=> no notch
@@ -78,10 +105,13 @@ def _fresh_state():
         run=0, n_windows=0,           # consecutive counted slots; total counted slots
         hot_run=0, alert="", alert_since=None, alert_win=None,
         last_ref_id=None,
+        last_ref_ts=None,             # newest cuff seen, anchored or not (forward-only guard)
+        last_cuff=None,               # newest cuff seen: dict(sbp, dbp, ts, anchored)
         last_epoch_ts=None, last_value=None, last_value_ts=None,
         hist=[],                      # last TREND_HIST slot medians [sbp, dbp]
         cal_key=None,                 # slot of the last CALIBRATING (cuff-value) publish
         early_done=False,             # the early first value for this cuff has been published
+        ema=None,                     # [sbp, dbp] EMA of good per-epoch values since the anchor
     )
 
 
@@ -163,16 +193,19 @@ class V7Engine(object):
             # patient. Two consecutive quiet slots still drop them back to LOW confidence.
             s["run"] = max(0, s["run"] - 1)
             return None
-        sbp = float(np.median([v[0] for v in vals]))
-        dbp = float(np.median([v[1] for v in vals]))
+        raw_s = float(np.median([v[0] for v in vals]))
+        raw_d = float(np.median([v[1] for v in vals]))
+        sbp, dbp = self._shown(s, raw_s, raw_d)
         hb  = [v[2] for v in vals if isinstance(v[2], (int, float))]
         glu = [v[3] for v in vals if isinstance(v[3], (int, float))]
         s["run"] += 1
         s["n_windows"] += 1
         s["hist"] = (s["hist"] + [[round(sbp, 1), round(dbp, 1)]])[-TREND_HIST:]
         established = s["run"] >= 2
-        hot_s = abs(sbp - s["anchor_s"]) >= ALERT_SBP
-        hot_d = abs(dbp - s["anchor_d"]) >= ALERT_DBP
+        # the alert rule reads the RAW slot median, as before smoothing: the shown value only
+        # carries half of v7's change, so it could never reach the +-15/+-10 breach
+        hot_s = abs(raw_s - s["anchor_s"]) >= ALERT_SBP
+        hot_d = abs(raw_d - s["anchor_d"]) >= ALERT_DBP
         hot = hot_s or hot_d
         s["hot_run"] = s["hot_run"] + 1 if hot else 0
         alert_new = False
@@ -190,7 +223,7 @@ class V7Engine(object):
             s["alert_win"] = s["win_key"]
             alert_new = True
         return dict(
-            sbp=round(sbp, 1), dbp=round(dbp, 1),
+            sbp=round(sbp, 1), dbp=round(dbp, 1), sbp_raw=round(raw_s, 1), dbp_raw=round(raw_d, 1),
             hb=(round(float(np.mean(hb)), 1) if hb else None),
             glucose=(int(round(float(np.mean(glu)))) if glu else None),
             n_good=len(vals), n_epochs=n_epochs,
@@ -198,6 +231,16 @@ class V7Engine(object):
             established=established, hot=hot, hot_sbp=hot_s, hot_dbp=hot_d,
             alert=s["alert"], alert_new=alert_new, run=s["run"],
         )
+
+    @staticmethod
+    def _shown(s, raw_s, raw_d):
+        """The value to publish: anchor + SHRINK * (EMA - anchor) when smoothing is on and the EMA
+        has seen a GOOD epoch, else the raw slot median."""
+        e = s.get("ema")
+        if SMOOTH and e is not None:
+            return (s["anchor_s"] + SMOOTH_SHRINK * (e[0] - s["anchor_s"]),
+                    s["anchor_d"] + SMOOTH_SHRINK * (e[1] - s["anchor_d"]))
+        return raw_s, raw_d
 
     @staticmethod
     def trend(s):
@@ -236,31 +279,51 @@ class V7Engine(object):
         # ---- reference bookkeeping (prototype FIX 5 / FIX 7b) ------------------------------
         have_ref = isinstance(ref_sbp, (int, float)) and ref_sbp > 0
         new_ts = ref_ts if (isinstance(ref_ts, (int, float)) and ref_ts > 0) else None
-        stale = (have_ref and new_ts is not None and s["anchor_ts"] is not None
-                 and new_ts < s["anchor_ts"])
+        # forward-only: compare with the newest cuff SEEN, not only the anchor - a cuff held
+        # inside the re-anchor range is newer than the anchor, and an older replay must not
+        # slip in between and become the anchor
+        newest = max([x for x in (s["anchor_ts"], s.get("last_ref_ts")) if x is not None], default=None)
+        stale = (have_ref and new_ts is not None and newest is not None and new_ts < newest)
         if stale:
-            print("[V7] stale reference REJECTED for %s: %s/%s @%d older than anchor %s/%s @%d"
-                  % (adm, ref_sbp, ref_dbp, new_ts, s["anchor_s"], s["anchor_d"], s["anchor_ts"]))
+            print("[V7] stale reference REJECTED for %s: %s/%s @%d older than the newest cuff @%d "
+                  "(anchor %s/%s)" % (adm, ref_sbp, ref_dbp, new_ts, newest, s["anchor_s"], s["anchor_d"]))
             sys.stdout.flush()
         if have_ref and not stale:
             rid = self._ref_key(new_ts, ref_sbp, ref_dbp)
-            if rid != s["last_ref_id"]:
-                # any genuinely NEW cuff (even an identical repeat) retires the alert
+            if rid != s["last_ref_id"] and rid != s["anchor_key"]:
+                # a genuinely NEW cuff (even an identical repeat): it retires the alert either way
                 s["alert"], s["alert_since"], s["alert_win"] = "", None, None
                 s["last_ref_id"] = rid
-            if rid != s["anchor_key"]:
-                # a new cuff: rebuild the model anchor from scratch, drop the open slot — it
-                # belonged to the old anchor (prototype FIX 3)
-                s.update(anchor_key=rid, anchor_ts=new_ts,
-                         anchor_s=float(ref_sbp), anchor_d=float(ref_dbp or 0),
-                         anchor_f=None, buf=[], run=0, hot_run=0,
-                         win=[], win_key=None, win_epochs=0, win_first_ts=None,
-                         last_value=None, hist=[], cal_key=None, early_done=False)
-                print("[V7] new anchor cuff for %s: %s/%s (ref id %s)" % (adm, ref_sbp, ref_dbp, rid))
+                if new_ts is not None:
+                    s["last_ref_ts"] = new_ts
+                d_s = float(ref_sbp) - s["anchor_s"] if s["anchor_s"] is not None else None
+                d_d = float(ref_dbp or 0) - s["anchor_d"] if s["anchor_d"] is not None else None
+                outside = (s["anchor_key"] is None
+                           or abs(d_s) >= REANCHOR_SBP or abs(d_d) >= REANCHOR_DBP)
+                s["last_cuff"] = dict(sbp=float(ref_sbp), dbp=float(ref_dbp or 0), ts=new_ts,
+                                      anchored=bool(outside))
+                if outside:
+                    # first cuff, or outside the range: rebuild the model anchor from scratch and
+                    # drop the open slot - it belonged to the old anchor (prototype FIX 3)
+                    s.update(anchor_key=rid, anchor_ts=new_ts,
+                             anchor_s=float(ref_sbp), anchor_d=float(ref_dbp or 0),
+                             anchor_f=None, buf=[], run=0, hot_run=0,
+                             win=[], win_key=None, win_epochs=0, win_first_ts=None,
+                             last_value=None, hist=[], cal_key=None, early_done=False,
+                             ema=None)
+                    print("[V7] new anchor cuff for %s: %s/%s (ref id %s)" % (adm, ref_sbp, ref_dbp, rid))
+                else:
+                    # inside the range: keep the anchor, its baseline, the open slot and the run;
+                    # restart the breach count so a retired alert needs 2 fresh breaching slots
+                    s["hot_run"] = 0
+                    print("[V7] cuff %s/%s for %s within +-%g/+-%g of anchor %s/%s (%+.0f/%+.0f) - "
+                          "anchor KEPT, alert retired" % (ref_sbp, ref_dbp, adm, REANCHOR_SBP, REANCHOR_DBP,
+                                                          s["anchor_s"], s["anchor_d"], d_s, d_d))
                 sys.stdout.flush()
         out["alert"] = s["alert"]
         if s["anchor_key"] is not None:
-            out["anchor"] = dict(sbp=s["anchor_s"], dbp=s["anchor_d"], key=s["anchor_key"], ts=s["anchor_ts"])
+            out["anchor"] = dict(sbp=s["anchor_s"], dbp=s["anchor_d"], key=s["anchor_key"], ts=s["anchor_ts"],
+                                 last_cuff=s.get("last_cuff"))
 
         # ---- a long silence discards the open slot instead of publishing it late ----------
         if s["last_epoch_ts"] is not None and ts - s["last_epoch_ts"] >= STALE_SEC and s["win_key"] is not None:
@@ -327,6 +390,9 @@ class V7Engine(object):
         if good:
             # unrounded, so the slot median is bit-identical to the dashboard runtime's
             s["win"].append([sbp, dbp, hb, glu])
+            e = s.get("ema")
+            s["ema"] = ([sbp, dbp] if e is None else
+                        [e[0] + SMOOTH_ALPHA * (sbp - e[0]), e[1] + SMOOTH_ALPHA * (dbp - e[1])])
         if out["window"] is None:
             out["window"] = self._maybe_early(s)
         out["alert"] = s["alert"]
@@ -354,14 +420,15 @@ class V7Engine(object):
         if len(vals) < MIN_EP_WINDOW:
             return None
         s["early_done"] = True
-        sbp = float(np.median([v[0] for v in vals]))
-        dbp = float(np.median([v[1] for v in vals]))
+        raw_s = float(np.median([v[0] for v in vals]))
+        raw_d = float(np.median([v[1] for v in vals]))
+        sbp, dbp = V7Engine._shown(s, raw_s, raw_d)
         hb  = [v[2] for v in vals if isinstance(v[2], (int, float))]
         glu = [v[3] for v in vals if isinstance(v[3], (int, float))]
-        hot_s = abs(sbp - s["anchor_s"]) >= ALERT_SBP
-        hot_d = abs(dbp - s["anchor_d"]) >= ALERT_DBP
+        hot_s = abs(raw_s - s["anchor_s"]) >= ALERT_SBP
+        hot_d = abs(raw_d - s["anchor_d"]) >= ALERT_DBP
         return dict(
-            sbp=round(sbp, 1), dbp=round(dbp, 1),
+            sbp=round(sbp, 1), dbp=round(dbp, 1), sbp_raw=round(raw_s, 1), dbp_raw=round(raw_d, 1),
             hb=(round(float(np.mean(hb)), 1) if hb else None),
             glucose=(int(round(float(np.mean(glu)))) if glu else None),
             n_good=len(vals), n_epochs=s["win_epochs"],

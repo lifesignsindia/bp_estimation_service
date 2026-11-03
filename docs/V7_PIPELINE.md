@@ -150,6 +150,15 @@ case-sensitive match) and stores capital-E `Estimated_*` without showing it.
   `NO_REFERENCE_CUFF`, `EPOCH_REJECTED`, `INFERENCE_FAILED`, `ESTIMATE_OUT_OF_RANGE`.
   `message` stays as human-readable detail.
 
+- **Null on error.** On `poor_signal` (incl. flat signal), any `error`, or a device SpO2 / PR error
+  in the spo2 block (`spo2Error`/`SPO2_ERROR` non-zero, or `spo2ErrorMsg` / `prErrorMsg` not a
+  `*_VALID` message, e.g. `SPO2_UNKNOWN_ERROR`, `PR_INVALID_DATA`), the packet carries SpO2, PR
+  (`spo2`/`pulseRate`, or `SPO2`/`PR`) and `bp.estimated_sbp/dbp/map` as JSON `null`, keys present
+  even when the device dropped them; accumulating `Estimated_*` are nulled too. Cuff readings are
+  never touched and no spo2 block is invented. Such a packet has `display: false`; when it had no
+  error_code it gets `SPO2_INVALID`, `PR_INVALID` or `SPO2_PR_INVALID` (this includes a 15-min
+  success/alert packet, whose estimate is then null).
+
 All of it is applied in one place, `process_vitals`.
 
 ## State
@@ -186,7 +195,7 @@ next to `ref:{adm}` so pods and restarts share it.
 - No estimate without a cuff. First alert ~1 h after the cuff. (2026-09-28: the cuff itself is
   now shown as `CALIBRATING` from ~3 min after it, until the first 15-min value.) Alerts latch until a new cuff.
 - Kept as-is, still temporary: the facility gate (`EBP_ALLOWED_FACILITY`, default
-  `CF1315821527` only since 2026-09-05, `CF1315821527,CF199221737` since 2026-09-28; comma-separate to add, empty to disable) and the Mongo
+  `CF1315821527` only since 2026-09-05, `CF1315821527,CF199221737` since 2026-09-28, `CF1315821527,CF199221737,CF965742886,CF1094500946` since 2026-10-29; comma-separate to add, empty to disable) and the Mongo
   shadow sink (`MONGO_SINK_ENABLED`).
 - 2026-09-28 cuff path: `0/0` (or any zero half) is "no reading" and ignored. A non-manual cuff
   within 5 mmHg of the stored reference is a re-send and keeps the stored reference AND its

@@ -31,6 +31,9 @@ Checks
      it stays latched until the next cuff
   10. smoothing: a steady v7 change is shown as half of it (anchor + 0.5 x EMA change), the
       alert still reads the raw median; V7_SMOOTH=off publishes the raw slot median
+  11. change check: closed slots carry change_check (shadow, quiet at baseline); signals past
+      the threshold in 2 slots raise it (direction up, 'take a manual cuff') without touching the
+      alert; live mode publishes it as alert BP_MAY_HAVE_CHANGED; any new cuff retires it
 """
 import os
 import sys
@@ -392,6 +395,58 @@ def run():
     finally:
         E7.CAL_PUBLISH = True
     E7.CAL_PUBLISH = CAL_DEFAULT
+
+    # ---- 11. change check: "BP may have changed - take a cuff" -----------------------------
+    phase = {"v": "base", "i": 0}
+
+    def _fake_pick(f, names):
+        phase["i"] += 1
+        j = (phase["i"] % 3 - 1) * 0.01
+        if phase["v"] == "base":
+            return [0.0 + j, -0.5 + j, 80.0 + 100 * j]
+        return [0.4, -0.1, 92.0]            # every signal far past its noise, the "BP up" way
+
+    def _run_change(sbp, dbp):
+        nonlocal t
+        phase["v"] = "base"
+        t += 180
+        VS.process_vitals(cuff(sbp, dbp, t))
+        outs = []
+        for i in range(30):                 # 90 min: anchor, then several closed slots
+            if i == 8:
+                phase["v"] = "moved"
+            t += 180
+            outs.append(VS.process_vitals(epoch(eps[i % len(eps)], t)))
+        return [o for o in outs if o.get("change_check")]
+
+    real_pick = E7.C.pick
+    E7.C.pick = _fake_pick
+    try:
+        cc = _run_change(160, 100)
+        check(bool(cc) and cc[0]["change_check"]["mode"] == "shadow" and cc[0]["change_check"]["suspected"] is False,
+              "change check: reported on closed slots, shadow mode, quiet while the signals are at baseline")
+        up = [o for o in cc if o["change_check"]["suspected"]]
+        check(bool(up) and up[0]["change_check"]["direction"] == "up"
+              and "take a manual cuff" in (up[0]["change_check"]["message"] or ""),
+              "change check: signals past the threshold in 2 slots -> suspected, direction up, 'take a manual cuff'")
+        check(all(o.get("alert") != "BP_MAY_HAVE_CHANGED" for o in cc),
+              "shadow mode: the change check never drives the published alert")
+        E7.C.MODE = "live"
+        cc = _run_change(110, 70)
+        up = [o for o in cc if o["change_check"]["suspected"]]
+        check(bool(up) and up[0]["status"] == "alert" and up[0]["alert"] == "BP_MAY_HAVE_CHANGED"
+              and "take a manual cuff" in up[0]["message"],
+              "live mode: a raised change check is published as status alert BP_MAY_HAVE_CHANGED")
+        phase["v"] = "base"
+        t += 60
+        VS.process_vitals(cuff(118, 76, t))           # within range: anchor kept, check retired
+        t += 60
+        VS.process_vitals(epoch(eps[2], t))           # v7 sees the cuff on the next pleth epoch
+        st = VS.v7_engine.load_state(ADM)
+        check(st["chg"] == "" and st["anchor_s"] == 110.0, "a new cuff (even within range) retires the change check")
+    finally:
+        E7.C.pick = real_pick
+        E7.C.MODE = "shadow"
 
     print("\n%d checks failed" % len(fails) if fails else "\nALL CHECKS PASSED")
     return 1 if fails else 0

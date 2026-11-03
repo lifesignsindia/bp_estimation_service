@@ -1,5 +1,5 @@
 # Only the runtime needs to reach the image:
-#   kafka_consumer.py vitals_standalone.py v7_engine.py bpv4_features.py inference_engine.py
+#   kafka_consumer.py vitals_standalone.py v7_engine.py v7_change.py bpv4_features.py inference_engine.py
 #   mongo_sink.py config.py processors/ models/ requirements.txt
 # Everything else is analysis, dashboards, captured patient data or secrets.
 

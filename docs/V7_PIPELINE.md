@@ -117,6 +117,47 @@ Repeating the anchor cuff scores about the same (60% both, MAP 80%): v7's change
 on NISO101 (no single feature tracks BP between cuffs on this data), so the gain is from
 damping that noise, not from better tracking.
 
+### Change check: "BP may have changed - take a cuff" (2026-11-03, SHADOW until validated)
+
+Not a BP number. With every anchor, the change check learns the patient's own baseline of three
+signals from the same GOOD epochs that build the anchor: `aging_index`, `apg_b_a` (pulse-shape,
+second derivative) and pleth `hr` (median and robust spread, with a noise floor). Each closed
+15-min slot is turned into z-scores against that baseline. The score is the mean of the clipped z
+(all three signed "BP up" = up). If |score| >= 2.1 in 2 consecutive slots in the same direction,
+the check is raised: `BP may have changed (likely rising / falling) - take a manual cuff`. It stays
+latched until the next cuff; any new cuff, even one inside the +-15/+-10 range, retires it. It
+also reports a mean-reversion opinion (`reversion`: a reference well above / below the patient's
+earlier cuffs, or 125 systolic, tends to come back). That is a second opinion only and never raises
+the check.
+
+Every closed-slot payload carries it (additive field; display and estimates unaffected):
+
+    "change_check": {"suspected": true, "direction": "up", "score": 2.4,
+                     "signals": {"aging_index": 2.9, "apg_b_a": 2.1, "hr": 2.2},
+                     "reversion": "down", "mode": "shadow",
+                     "message": "BP may have changed (likely rising) - take a manual cuff."}
+
+`V7_CHANGE_CHECK=shadow` (default): computed, logged (`[CHANGE]`) and stored; the published alert
+keeps the +-15/+-10 median rule. `live`: a raised check is published as `status: "alert"`,
+`alert: "BP_MAY_HAVE_CHANGED"` with the message above, and replaces the median rule. `off`: not
+computed.
+
+**Evidence so far (CIMS NISO101, 67 cuff intervals, 23 patients, 28 real changes; signs and
+threshold learned leave-one-patient-out).** With the threshold set for <= 20% false checks: flagged
+before 7 of 28 real changes (25%) vs 7 of 39 stable intervals (18%), so it does NOT yet tell
+whether BP changed (p = 0.34). When it fired before a real change, the direction was right 7/7
+(10/11 at a looser threshold). Too few cases to trust either way.
+
+**Go-live pass mark (fixed 2026-11-03, before any new data is seen).** Score on NISO101 data
+collected after this date (new patients only), interval = reference in use -> next cuff, real
+change = >= 15 SBP or >= 10 DBP, defaults unchanged:
+1. flagged before >= 40% of real changes, AND
+2. flagged before <= 20% of stable intervals, AND
+3. flag rate real > stable with one-sided Fisher p < 0.05, AND
+4. direction right on >= 70% of flagged real changes, with at least 15 flagged real changes.
+If it passes, set `V7_CHANGE_CHECK=live`. If not, it stays in shadow; signals or thresholds are
+changed only with a new pass mark written before re-testing on data not yet used.
+
 ### Display flag (2026-09-28)
 
 Every result now reaches `vitals.clinical` (`EBP_FORWARD_STATUSES`, default
@@ -175,6 +216,8 @@ next to `ref:{adm}` so pods and restarts share it.
 | `V7_REANCHOR_SBP` / `V7_REANCHOR_DBP` | 15 / 10 | a new cuff re-anchors only this far from the anchor (0 / 0 = every cuff) |
 | `V7_SMOOTH` | 1 | publish anchor + `V7_SMOOTH_SHRINK` x (EMA - anchor) instead of the raw slot median (0 = raw) |
 | `V7_SMOOTH_ALPHA` / `V7_SMOOTH_SHRINK` | 0.25 / 0.5 | EMA weight per GOOD epoch / share of v7's change shown |
+| `V7_CHANGE_CHECK` | shadow | change check: `shadow` (report only), `live` (drives the alert), `off` |
+| `V7_CHANGE_THRESHOLD` / `V7_CHANGE_PERSIST` | 2.1 / 2 | change score needed / consecutive slots |
 
 ## Decisions taken (2026-09-03)
 

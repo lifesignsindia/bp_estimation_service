@@ -50,6 +50,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import bpv4_features as V   # noqa: E402  (same DSP as the validated prototype)
+import v7_change as C       # noqa: E402  ("BP may have changed - take a cuff" check)
 
 MODEL_DIR     = os.getenv("V7_MODEL_DIR", os.path.join(_HERE, "models", "v7"))
 WINDOW_SEC    = int(os.getenv("V7_WINDOW_SEC", "900"))        # wall-clock slot length
@@ -112,6 +113,10 @@ def _fresh_state():
         cal_key=None,                 # slot of the last CALIBRATING (cuff-value) publish
         early_done=False,             # the early first value for this cuff has been published
         ema=None,                     # [sbp, dbp] EMA of good per-epoch values since the anchor
+        cbuf=[], cbase=None,          # change check: anchor-epoch signals and their baseline
+        chg_run=0, chg_dir=0,         # consecutive slots past the change threshold, and their sign
+        chg="", chg_since=None,       # latched change check ("up" / "down"), until a new cuff
+        cuffs_seen=[],                # systolic of earlier cuffs (mean-reversion opinion)
     )
 
 
@@ -230,7 +235,30 @@ class V7Engine(object):
             key=s["win_key"], start=s["win_key"] * WINDOW_SEC, end=(s["win_key"] + 1) * WINDOW_SEC,
             established=established, hot=hot, hot_sbp=hot_s, hot_dbp=hot_d,
             alert=s["alert"], alert_new=alert_new, run=s["run"],
+            change=self._change(s, vals),
         )
+
+    def _change(self, s, vals):
+        """Change check on a closed slot (see v7_change). Updates the latch; returns the block that
+        goes into the window, or None when the check is off or has no baseline yet."""
+        if not C.enabled() or s.get("cbase") is None:
+            return None
+        z = C.slot_z([v[4] for v in vals if len(v) > 4], s["cbase"])
+        sc = C.score(z)
+        d = 0 if sc is None or abs(sc) < C.CHG_THRESHOLD else int(np.sign(sc))
+        s["chg_run"] = s["chg_run"] + 1 if (d != 0 and d == s["chg_dir"]) else (1 if d != 0 else 0)
+        s["chg_dir"] = d
+        new = False
+        if s["chg_run"] >= C.CHG_PERSIST and not s["chg"]:
+            s["chg"], s["chg_since"], new = ("up" if d > 0 else "down"), time.time(), True
+            print("[V7] change check RAISED: BP may have gone %s (score %.2f, z %s)"
+                  % (s["chg"], sc, [None if v is None else round(v, 2) for v in z]))
+            sys.stdout.flush()
+        rev = C.reversion(s["anchor_s"], s.get("cuffs_seen", [])[:-1])
+        return dict(suspected=bool(s["chg"]), direction=s["chg"] or None, new=new,
+                    score=(None if sc is None else round(sc, 2)),
+                    z=dict(zip(C.SIGNALS, [None if v is None else round(v, 2) for v in z])),
+                    reversion={1: "up", -1: "down"}.get(rev), mode=C.MODE)
 
     @staticmethod
     def _shown(s, raw_s, raw_d):
@@ -302,6 +330,9 @@ class V7Engine(object):
                            or abs(d_s) >= REANCHOR_SBP or abs(d_d) >= REANCHOR_DBP)
                 s["last_cuff"] = dict(sbp=float(ref_sbp), dbp=float(ref_dbp or 0), ts=new_ts,
                                       anchored=bool(outside))
+                # any new cuff answers "take a cuff": the change check is retired and restarts
+                s["cuffs_seen"] = (s.get("cuffs_seen", []) + [float(ref_sbp)])[-20:]
+                s["chg"], s["chg_since"], s["chg_run"], s["chg_dir"] = "", None, 0, 0
                 if outside:
                     # first cuff, or outside the range: rebuild the model anchor from scratch and
                     # drop the open slot - it belonged to the old anchor (prototype FIX 3)
@@ -310,7 +341,7 @@ class V7Engine(object):
                              anchor_f=None, buf=[], run=0, hot_run=0,
                              win=[], win_key=None, win_epochs=0, win_first_ts=None,
                              last_value=None, hist=[], cal_key=None, early_done=False,
-                             ema=None)
+                             ema=None, cbuf=[], cbase=None)
                     print("[V7] new anchor cuff for %s: %s/%s (ref id %s)" % (adm, ref_sbp, ref_dbp, rid))
                 else:
                     # inside the range: keep the anchor, its baseline, the open slot and the run;
@@ -361,9 +392,11 @@ class V7Engine(object):
         if s["anchor_f"] is None:
             if good:
                 s["buf"].append([float(v) for v in fvi])
+                s.setdefault("cbuf", []).append(C.pick(f, V.NAMES))
                 if len(s["buf"]) >= N_ANCHOR:
                     s["anchor_f"] = [float(v) for v in np.median(np.asarray(s["buf"], float), 0)]
                     s["buf"] = []
+                    s["cbase"], s["cbuf"] = C.baseline(s["cbuf"]), []
                     print("[V7] anchor built for %s from %d good epochs" % (adm, N_ANCHOR))
                     sys.stdout.flush()
             out["state"] = "calibrating"
@@ -389,7 +422,7 @@ class V7Engine(object):
         s["win_epochs"] += 1
         if good:
             # unrounded, so the slot median is bit-identical to the dashboard runtime's
-            s["win"].append([sbp, dbp, hb, glu])
+            s["win"].append([sbp, dbp, hb, glu, C.pick(f, V.NAMES)])
             e = s.get("ema")
             s["ema"] = ([sbp, dbp] if e is None else
                         [e[0] + SMOOTH_ALPHA * (sbp - e[0]), e[1] + SMOOTH_ALPHA * (dbp - e[1])])

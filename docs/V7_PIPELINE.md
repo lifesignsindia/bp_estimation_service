@@ -158,6 +158,14 @@ change = >= 15 SBP or >= 10 DBP, defaults unchanged:
 If it passes, set `V7_CHANGE_CHECK=live`. If not, it stays in shadow; signals or thresholds are
 changed only with a new pass mark written before re-testing on data not yet used.
 
+### NISO204 not processed (2026-11-10)
+
+NISO204 packets are dropped right after device detection: no BP estimation, no SpO2 / PR
+handling, no primary-device lock, and no output packet (like a facility outside the gate). Its
+pleth is ~60 Hz, not the 200 Hz the DSP assumed, so every packet ended as `poor_signal` and the
+null rule sent its valid SpO2 / PR as null. NISO204 cuffs were never references (only NISO206 and
+manual entries are), so nothing that fed v7 is lost.
+
 ### Display flag (2026-09-28)
 
 Every result now reaches `vitals.clinical` (`EBP_FORWARD_STATUSES`, default

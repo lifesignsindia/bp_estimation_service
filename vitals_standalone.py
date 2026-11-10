@@ -526,6 +526,15 @@ def _process_vitals(json_data):
 
     device_type = _detect_device(json_data)
 
+    # NISO204 is not processed at all (2026-11-10): no BP estimation, no SpO2 / PR handling, no
+    # device lock, nothing published - exactly like a facility outside the gate. Its pleth is ~60 Hz
+    # (not the 200 Hz the DSP assumed), so every packet ended as poor_signal and its valid SpO2 / PR
+    # were sent as null. NISO204 cuffs were never used as references (only NISO206 / manual are).
+    if device_type == DEVICE_NISO204:
+        print(f"[SKIP] adm={adm_id} | device=NISO204 not processed - no output")
+        sys.stdout.flush()
+        return None
+
     # NISO101 (BerryMed) ONLY: the spo2 block carries a per-sample pulse-rate array
     # under `PR_ALL`. Add `spo2.PR` = mean of the plausible (25-220 bpm) samples;
     # `PR_ALL` and the spo2/SpO2 samples are left untouched. NISO103 and every other
@@ -646,7 +655,7 @@ def _process_vitals(json_data):
 
     if device_type == "UNKNOWN":
         return {**_meta, "status": "error", "error_code": "UNKNOWN_DEVICE", "admissionId": adm_id,
-                "message": f"Unknown deviceName: {json_data.get('deviceName')}. Expected NISO101/NISO103/NISO204."}
+                "message": f"Unknown deviceName: {json_data.get('deviceName')}. Expected NISO101/NISO103."}
 
     # --- PRIMARY DEVICE LOCK (NISO101 preferred) ---
     # NISO101 (BERRYMED) is always the main BP-estimation device: whenever a 101 packet

@@ -31,6 +31,7 @@ Checks
      it stays latched until the next cuff
   10. smoothing: a steady v7 change is shown as half of it (anchor + 0.5 x EMA change), the
       alert still reads the raw median; V7_SMOOTH=off publishes the raw slot median
+  9b. NISO204 packets are not processed at all (no output, no device lock)
   11. change check: closed slots carry change_check (shadow, quiet at baseline); signals past
       the threshold in 2 slots raise it (direction up, 'take a manual cuff') without touching the
       alert; live mode publishes it as alert BP_MAY_HAVE_CHANGED; any new cuff retires it
@@ -220,6 +221,16 @@ def run():
     rq = VS.process_vitals(pk)
     check((rq.get("sqi") or {}).get("v7_quality") == "GOOD",
           f"cut-short BerryMed packet of 2160 samples is still read at 200 Hz (q={(rq.get('sqi') or {}).get('v7_quality')})")
+
+    # ---- 9b. NISO204 is not processed at all: no output, no device lock ----------------------
+    adm204 = "ADM_TEST_NISO204"
+    p204 = {"admissionId": adm204, "facilityId": FAC, "epochTime": int((t + 5) * 1000),
+            "device": {"deviceName": "NISO204", "deviceType": "BP_SPO2"},
+            "spo2": {"spo2": 97, "pulseRate": 80, "spo2Error": 0, "prError": 0},
+            "pleth": {"plethWave": list(eps[0])[:1805]}}
+    r204 = VS.process_vitals(p204)
+    check(r204 is None and VS._primary_read(adm204) is None,
+          "NISO204 packet: not processed, nothing published, no primary-device lock")
 
     # ---- 8. output contract: input packet preserved, display, error_code, integer estimates --
     allr += [r_flat, r_noise]

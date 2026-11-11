@@ -24,9 +24,17 @@ Checks
      never sent under either casing
   3. flat and noisy epochs are dropped from the slot (poor_signal, not published, not counted)
   4. the published payload keeps the legacy shape (bp block, sqi, pleth, Hb/glucose, _meta)
-  5. a new cuff rebuilds the anchor and clears any alert
+  5. a cuff beyond +-15/+-10 of the anchor rebuilds it and clears any alert
+  5b. a cuff within +-15/+-10 (manual too) keeps the anchor, its baseline and the run, and
+      retires the alert; an older replayed cuff cannot become the anchor
   6. a forced +20 mmHg delta raises an alert only after two ESTABLISHED breaching slots, and
      it stays latched until the next cuff
+  10. smoothing: a steady v7 change is shown as half of it (anchor + 0.5 x EMA change), the
+      alert still reads the raw median; V7_SMOOTH=off publishes the raw slot median
+  9b. NISO204 packets are not processed at all (no output, no device lock)
+  11. change check: closed slots carry change_check (shadow, quiet at baseline); signals past
+      the threshold in 2 slots raise it (direction up, 'take a manual cuff') without touching the
+      alert; live mode publishes it as alert BP_MAY_HAVE_CHANGED; any new cuff retires it
 """
 import os
 import sys
@@ -79,10 +87,13 @@ def good_epochs(n_needed=40):
     return picked
 
 
-def cuff(sbp, dbp, ts):
-    return {"admissionId": ADM, "facilityId": FAC, "epochTime": int(ts * 1000),
-            "device": {"deviceName": "NISO206", "deviceType": "BP"},
-            "bp": {"BPSYS": sbp, "BPDIA": dbp, "BP_ERROR": 0}}
+def cuff(sbp, dbp, ts, manual=False):
+    m = {"admissionId": ADM, "facilityId": FAC, "epochTime": int(ts * 1000),
+         "device": {"deviceName": "NISO206", "deviceType": "BP"},
+         "bp": {"BPSYS": sbp, "BPDIA": dbp, "BP_ERROR": 0}}
+    if manual:
+        m["isManual"] = True
+    return m
 
 
 def epoch(samples, ts):
@@ -211,6 +222,16 @@ def run():
     check((rq.get("sqi") or {}).get("v7_quality") == "GOOD",
           f"cut-short BerryMed packet of 2160 samples is still read at 200 Hz (q={(rq.get('sqi') or {}).get('v7_quality')})")
 
+    # ---- 9b. NISO204 is not processed at all: no output, no device lock ----------------------
+    adm204 = "ADM_TEST_NISO204"
+    p204 = {"admissionId": adm204, "facilityId": FAC, "epochTime": int((t + 5) * 1000),
+            "device": {"deviceName": "NISO204", "deviceType": "BP_SPO2"},
+            "spo2": {"spo2": 97, "pulseRate": 80, "spo2Error": 0, "prError": 0},
+            "pleth": {"plethWave": list(eps[0])[:1805]}}
+    r204 = VS.process_vitals(p204)
+    check(r204 is None and VS._primary_read(adm204) is None,
+          "NISO204 packet: not processed, nothing published, no primary-device lock")
+
     # ---- 8. output contract: input packet preserved, display, error_code, integer estimates --
     allr += [r_flat, r_noise]
     check(all(isinstance(x.get("display"), bool) for x in allr), "every result carries a display flag")
@@ -319,7 +340,7 @@ def run():
             r = VS.process_vitals(epoch(eps[(i + 7) % len(eps)], t))
             first_after = first_after or r
             seq.append((r["status"], r.get("alert", ""), r.get("confidence", ""),
-                        bool((r.get("window") or {}).get("early"))))
+                        bool((r.get("window") or {}).get("early")), r.get("bp") or {}))
         st = VS.v7_engine.load_state(ADM)
         check(st["anchor_s"] == 110.0 and st["anchor_f"] is not None, "new cuff rebuilt the anchor at 110/70")
         check(first_after.get("confidence") == "CALIBRATING" and first_after["bp"]["estimated_sbp"] == 110
@@ -337,6 +358,22 @@ def run():
               "first slot LOW with no alert; alert fires on the second consecutive breaching slot")
         check(first_alert is not None and all(s[0] == "alert" for s in pubs[first_alert:]),
               "alert stays latched on every following slot")
+        # ---- 10. smoothing: shown = anchor + 0.5 * (EMA - anchor); the alert reads the raw median
+        shown = [s[4] for s in seq if s[0] in ("success", "alert") and s[2] != "CALIBRATING"]
+        check(bool(shown) and all(b.get("estimated_sbp") == 120 and b.get("estimated_dbp") == 71 for b in shown),
+              "smoothing: a steady +20/+2 v7 change is shown as half of it (120/71 on cuff 110/70)")
+        E7.SMOOTH = False
+        try:
+            t += 180
+            r_raw = None
+            for i in range(6):
+                t += 300
+                r = VS.process_vitals(epoch(eps[(i + 3) % len(eps)], t))
+                r_raw = r if r["status"] in ("success", "alert") else r_raw
+            check(r_raw is not None and r_raw["bp"]["estimated_sbp"] == 130 and r_raw["bp"]["estimated_dbp"] == 72,
+                  "V7_SMOOTH=off: the raw slot median 130/72 is published")
+        finally:
+            E7.SMOOTH = True
         # ---- 5a. a device re-send of the SAME value (new epochTime) is not a new cuff ------
         anchor_key_before = VS.v7_engine.load_state(ADM)["anchor_key"]
         t += 60
@@ -350,7 +387,40 @@ def run():
               and VS._ref_read(ADM)["sbp"] == 110 and st["anchor_key"] == anchor_key_before
               and st["anchor_f"] is not None and st["alert"],
               "same-value re-send and 0/0 keep the reference, the anchor and the alert")
-        # ---- 5. a new cuff clears the latch ---------------------------------------------
+        # ---- 5b. a cuff WITHIN +-15/+-10 of the anchor: anchor kept, alert retired ----------
+        # 118/76 vs anchor 110/70 = +8/+6: a real new value (passes the 5 mmHg duplicate filter)
+        # but inside the re-anchor range -> no rebuild, no CALIBRATING, values keep flowing
+        st0 = VS.v7_engine.load_state(ADM)
+        t += 180
+        VS.process_vitals(cuff(118, 76, t))
+        t += 180
+        r_in = VS.process_vitals(epoch(eps[2], t))
+        st = VS.v7_engine.load_state(ADM)
+        check(st["anchor_s"] == 110.0 and st["anchor_d"] == 70.0 and st["anchor_key"] == st0["anchor_key"]
+              and st["anchor_f"] is not None and st["anchor_f"] == st0["anchor_f"]
+              and st["run"] >= st0["run"] > 0,
+              "cuff 118/76 within +-15/+-10 of anchor 110/70: anchor, baseline and run kept")
+        check(st["alert"] == "" and r_in.get("confidence") != "CALIBRATING" and r_in["status"] != "accumulating"
+              or (st["alert"] == "" and r_in["status"] == "accumulating" and r_in.get("bp", {}).get("Estimated_sbp") is not None),
+              "within-range cuff retires the alert and v7 keeps producing values (no re-calibration)")
+        check((st.get("last_cuff") or {}).get("sbp") == 118.0 and (st.get("last_cuff") or {}).get("anchored") is False,
+              "within-range cuff is recorded as the last cuff, not anchored")
+        # a MANUAL entry inside the range follows the same rule
+        t += 180
+        VS.process_vitals(cuff(112, 72, t, manual=True))
+        t += 180
+        VS.process_vitals(epoch(eps[3], t))
+        st = VS.v7_engine.load_state(ADM)
+        check(st["anchor_s"] == 110.0 and st["anchor_f"] is not None,
+              "manual cuff 112/72 within range: anchor kept at 110/70")
+        # an OLDER cuff replayed after the held one is rejected (forward-only guard)
+        t += 60
+        VS.process_vitals(cuff(150, 95, t - 900))
+        t += 60
+        VS.process_vitals(epoch(eps[4], t))
+        st = VS.v7_engine.load_state(ADM)
+        check(st["anchor_s"] == 110.0, "a replayed cuff older than the newest cuff seen cannot become the anchor")
+        # ---- 5. a cuff OUTSIDE the range re-anchors and clears the latch ----------------
         t += 180
         VS.process_vitals(cuff(125, 82, t))
         t += 180
@@ -376,6 +446,58 @@ def run():
     finally:
         E7.CAL_PUBLISH = True
     E7.CAL_PUBLISH = CAL_DEFAULT
+
+    # ---- 11. change check: "BP may have changed - take a cuff" -----------------------------
+    phase = {"v": "base", "i": 0}
+
+    def _fake_pick(f, names):
+        phase["i"] += 1
+        j = (phase["i"] % 3 - 1) * 0.01
+        if phase["v"] == "base":
+            return [0.0 + j, -0.5 + j, 80.0 + 100 * j]
+        return [0.4, -0.1, 92.0]            # every signal far past its noise, the "BP up" way
+
+    def _run_change(sbp, dbp):
+        nonlocal t
+        phase["v"] = "base"
+        t += 180
+        VS.process_vitals(cuff(sbp, dbp, t))
+        outs = []
+        for i in range(30):                 # 90 min: anchor, then several closed slots
+            if i == 8:
+                phase["v"] = "moved"
+            t += 180
+            outs.append(VS.process_vitals(epoch(eps[i % len(eps)], t)))
+        return [o for o in outs if o.get("change_check")]
+
+    real_pick = E7.C.pick
+    E7.C.pick = _fake_pick
+    try:
+        cc = _run_change(160, 100)
+        check(bool(cc) and cc[0]["change_check"]["mode"] == "shadow" and cc[0]["change_check"]["suspected"] is False,
+              "change check: reported on closed slots, shadow mode, quiet while the signals are at baseline")
+        up = [o for o in cc if o["change_check"]["suspected"]]
+        check(bool(up) and up[0]["change_check"]["direction"] == "up"
+              and "take a manual cuff" in (up[0]["change_check"]["message"] or ""),
+              "change check: signals past the threshold in 2 slots -> suspected, direction up, 'take a manual cuff'")
+        check(all(o.get("alert") != "BP_MAY_HAVE_CHANGED" for o in cc),
+              "shadow mode: the change check never drives the published alert")
+        E7.C.MODE = "live"
+        cc = _run_change(110, 70)
+        up = [o for o in cc if o["change_check"]["suspected"]]
+        check(bool(up) and up[0]["status"] == "alert" and up[0]["alert"] == "BP_MAY_HAVE_CHANGED"
+              and "take a manual cuff" in up[0]["message"],
+              "live mode: a raised change check is published as status alert BP_MAY_HAVE_CHANGED")
+        phase["v"] = "base"
+        t += 60
+        VS.process_vitals(cuff(118, 76, t))           # within range: anchor kept, check retired
+        t += 60
+        VS.process_vitals(epoch(eps[2], t))           # v7 sees the cuff on the next pleth epoch
+        st = VS.v7_engine.load_state(ADM)
+        check(st["chg"] == "" and st["anchor_s"] == 110.0, "a new cuff (even within range) retires the change check")
+    finally:
+        E7.C.pick = real_pick
+        E7.C.MODE = "shadow"
 
     print("\n%d checks failed" % len(fails) if fails else "\nALL CHECKS PASSED")
     return 1 if fails else 0

@@ -526,6 +526,15 @@ def _process_vitals(json_data):
 
     device_type = _detect_device(json_data)
 
+    # NISO204 is not processed at all (2026-11-10): no BP estimation, no SpO2 / PR handling, no
+    # device lock, nothing published - exactly like a facility outside the gate. Its pleth is ~60 Hz
+    # (not the 200 Hz the DSP assumed), so every packet ended as poor_signal and its valid SpO2 / PR
+    # were sent as null. NISO204 cuffs were never used as references (only NISO206 / manual are).
+    if device_type == DEVICE_NISO204:
+        print(f"[SKIP] adm={adm_id} | device=NISO204 not processed - no output")
+        sys.stdout.flush()
+        return None
+
     # NISO101 (BerryMed) ONLY: the spo2 block carries a per-sample pulse-rate array
     # under `PR_ALL`. Add `spo2.PR` = mean of the plausible (25-220 bpm) samples;
     # `PR_ALL` and the spo2/SpO2 samples are left untouched. NISO103 and every other
@@ -633,7 +642,8 @@ def _process_vitals(json_data):
         return {
             "status": "ignored",
             "admissionId": adm_id,
-            "message": f"Reference BP for {adm_id} updated to {sys_val}/{dia_val}. AI will use this for calibration."
+            "message": (f"Reference BP for {adm_id} updated to {sys_val}/{dia_val}. v7 re-anchors to it only if it "
+                        f"differs from the current anchor by >=15 systolic or >=10 diastolic.")
         }
 
     # --- PATHWAY 2: CONTINUOUS MONITORS (For AI) ---
@@ -645,7 +655,7 @@ def _process_vitals(json_data):
 
     if device_type == "UNKNOWN":
         return {**_meta, "status": "error", "error_code": "UNKNOWN_DEVICE", "admissionId": adm_id,
-                "message": f"Unknown deviceName: {json_data.get('deviceName')}. Expected NISO101/NISO103/NISO204."}
+                "message": f"Unknown deviceName: {json_data.get('deviceName')}. Expected NISO101/NISO103."}
 
     # --- PRIMARY DEVICE LOCK (NISO101 preferred) ---
     # NISO101 (BERRYMED) is always the main BP-estimation device: whenever a 101 packet
@@ -863,10 +873,26 @@ def _process_vitals(json_data):
         label = trend.get("trend", "")
         morphology = "rising" if label.startswith("Rising") else ("falling" if label.startswith("Falling") else "stable")
 
-        if win["alert"]:
+        # change check ("BP may have changed - take a cuff", v7_change): in shadow mode it is only
+        # reported in change_check; in live mode it replaces the +-15/+-10 median alert
+        chg = win.get("change")
+        chg_live = bool(chg) and chg.get("mode") == "live"
+        chg_msg = None
+        if chg and chg["suspected"]:
+            way = {"up": "likely rising", "down": "likely falling"}.get(chg["direction"], "direction unclear")
+            chg_msg = f"BP may have changed ({way}) - take a manual cuff."
+            print(f"[CHANGE] adm={adm_id} | {chg['direction']} | score={chg['score']} | z={chg['z']} | "
+                  f"reversion={chg['reversion']} | mode={chg['mode']} | new={chg['new']}")
+            sys.stdout.flush()
+        alert_str = ("BP_MAY_HAVE_CHANGED" if chg_msg else "") if chg_live else win["alert"]
+
+        if chg_live and alert_str:
+            final_status = "alert"
+            final_msg = chg_msg + " (latched until a new cuff)"
+        elif alert_str:
             final_status = "alert"
             final_msg = (f"v7 alert {win['alert']} {'raised' if win['alert_new'] else 'active'}: "
-                         f"15-min median {sbp}/{dbp} vs cuff {ref_sbp_i}/{ref_dbp_i} "
+                         f"15-min median {sbp}/{dbp} vs anchor cuff {ref_sbp_i}/{ref_dbp_i} "
                          f"(latched until a new cuff).")
             print(f"[ALERT] adm={adm_id} | v7_median={sbp}/{dbp} | cuff={ref_sbp_i}/{ref_dbp_i} | {win['alert']} | new={win['alert_new']}")
             sys.stdout.flush()
@@ -892,7 +918,7 @@ def _process_vitals(json_data):
                 "reference_dbp": ref_dbp_i,
                 "BP_ERROR": 0
             },
-            "alert": win["alert"],
+            "alert": alert_str,
             "sqi": sqi_out,
             "trending": bool(win["hot"]),
             "morphology_change": morphology,
@@ -902,6 +928,11 @@ def _process_vitals(json_data):
             "pleth": {"PLETH": pleth_out},
             "message": final_msg
         }
+        if chg:
+            final_payload["change_check"] = {
+                "suspected": chg["suspected"], "direction": chg["direction"], "score": chg["score"],
+                "signals": chg["z"], "reversion": chg["reversion"], "mode": chg["mode"],
+                "message": chg_msg}
         if win["hb"] is not None:
             final_payload["hemoglobin"] = win["hb"]
         if win["glucose"] is not None:
